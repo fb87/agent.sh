@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
 ### Added
 
 - Plan mode (`-p`, `--plan`, `MODE=plan`, REPL `/plan`): the agent may only
@@ -75,5 +77,6 @@ OpenAI-compatible endpoint (OpenCode Go).
 - Model output is trusted as JSON only as far as the API guarantees it; a
   malformed stream aborts the turn rather than being repaired.
 
-[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fb87/agent.sh/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fb87/agent.sh/releases/tag/v0.1.0

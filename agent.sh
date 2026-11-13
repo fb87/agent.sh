@@ -48,7 +48,7 @@ SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}\
 /agent.sh/sessions}"
 PROMPT_DIR="${PROMPT_DIR:-./pro.mpts}"     # optional prompt overrides
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
