@@ -11,7 +11,10 @@
 #   -V       show the version (--version works too)
 #   prompt   optional first message (put -- before one that starts with '-')
 #
-# REPL commands: /help  /about  /sessions [all]  /resume ID  /reset  /auto  /exit (or Ctrl-D)
+# REPL commands: /help  /about  /compact  /sessions [all]  /resume ID  /reset  /auto
+#                /exit (or Ctrl-D)
+# A long history is summarized by itself once it reaches COMPACT_AT bytes
+# (AUTO_COMPACT=0 turns that off); /compact does it on demand.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
@@ -20,6 +23,8 @@ MODEL="${MODEL:-deepseek-v4.1-flash}"
 URL="${URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 AUTO="${AUTO:-0}"                                   # 1 = no confirmation prompt
 MAX_OUT="${MAX_OUT:-20000}"                         # tool output bytes sent to the model
+AUTO_COMPACT="${AUTO_COMPACT:-1}"                   # 1 = summarize a long history by itself
+COMPACT_AT="${COMPACT_AT:-100000}"                  # history bytes that trigger that
 TIMEOUT="${TIMEOUT:-300}"                           # give up after this many silent seconds
 SHOW_REASONING="${SHOW_REASONING:-1}"               # 1 = stream reasoning (dimmed)
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
@@ -72,6 +77,11 @@ about() {
   printf '  %-9s %s\n' endpoint "$URL"
   printf '  %-9s %s\n' sessions "$SESSION_DIR"
   printf '  %-9s %s\n' auto "$run"
+  if (( AUTO_COMPACT )); then
+    printf '  %-9s automatic above %s bytes\n' compact "$COMPACT_AT"
+  else
+    printf '  %-9s only with /compact\n' compact
+  fi
   printf '  %-9s %s, %s, %s\n' runtime "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
   printf '  %-9s %s\n' script "$0"
 }
@@ -302,31 +312,100 @@ ASSEMBLE='
 
 assemble() { jq -Rn --argjson partial "${1:-false}" "$ASSEMBLE" <"$TMP/sse"; }
 
-# Sends the history, streams the reply to the terminal, leaves the raw stream
-# in $TMP/sse. Retries only when nothing arrived or the server asks to retry,
-# never after part of a reply was already shown.
-call_api() {
-  local attempt code
+# One HTTP call: the request body on stdin, the SSE stream on stdout, the status
+# line in $TMP/hdr
+http_post() {
+  curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
+    -D "$TMP/hdr" "$URL" \
+    -H "Authorization: Bearer $OPENCODE_API_KEY" \
+    -H "Content-Type: application/json" \
+    -H "Accept: text/event-stream" \
+    -H "x-opencode-session: $SESSION_ID" \
+    -d @-
+}
+
+# Sends $1 (a messages array), leaves the raw stream in $TMP/sse. $2 = quiet
+# keeps the reply off the screen (compaction), otherwise it is streamed as it
+# arrives. Retries only when nothing arrived or the server asks to retry, never
+# after part of a reply was already shown.
+request() {
+  local msgs="$1" quiet="${2:-}" attempt code body
+  body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" --arg mode "$quiet" \
+    '{model: $model, reasoning_effort: "low", messages: ., stream: true}
+     + (if $mode == "quiet" then {} else {tools: $tools} end)' <<<"$msgs")
   for attempt in 1 2 3 4; do
     : >"$TMP/sse"; : >"$TMP/hdr"
-    jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-       '{model: $model, reasoning_effort: "low", tools: $tools, messages: ., stream: true}' <<<"$MESSAGES" |
-    curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
-      -D "$TMP/hdr" "$URL" \
-      -H "Authorization: Bearer $OPENCODE_API_KEY" \
-      -H "Content-Type: application/json" \
-      -H "Accept: text/event-stream" \
-      -H "x-opencode-session: $SESSION_ID" \
-      -d @- |
-    tee "$TMP/sse" | show_stream || true
-    (( INTERRUPTED )) && return
+    if [[ "$quiet" == quiet ]]; then
+      printf '%s' "$body" | http_post | tee "$TMP/sse" >/dev/null || true
+    else
+      printf '%s' "$body" | http_post | tee "$TMP/sse" | show_stream || true
+    fi
+    (( INTERRUPTED )) && return 0
     code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
-    [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]] && return
+    [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]] && return 0
     (( attempt < 4 )) || return 0
     printf '(request failed%s; retrying in %ss...)\n' "${code:+, HTTP $code}" $((attempt * 2)) >&2
     sleep $((attempt * 2)) || true
-    (( INTERRUPTED )) && return
+    (( INTERRUPTED )) && return 0
   done
+}
+
+call_api() { request "$MESSAGES"; }
+
+# ---------------------------------------------------------------- compacting
+
+# What to keep when the conversation is folded into a summary
+COMPACT_ASK='Summarize the conversation above so that everything before it can be dropped from the context. Keep the task and its goal, the decisions and why, the files and paths involved, the commands run and what they showed, the current state, and what is left to do. Output the summary only, no preamble.'
+
+# Folds the conversation into one summary message (system + summary). The old
+# transcript is left next to the session file as <id>.json.bak.
+compact() {
+  local msgs result summary count before after
+  INTERRUPTED=0            # a Ctrl-C that ended the previous turn is not ours
+  count=$(jq '[.[] | select(.role != "system")] | length' <<<"$MESSAGES")
+  if (( count == 0 )); then
+    echo "Nothing to compact yet."
+    return 1
+  fi
+  msgs=$(jq -c --arg q "$COMPACT_ASK" "$REPAIR"'
+      | . + [{role: "user", content: $q}]' <<<"$MESSAGES")
+  request "$msgs" quiet
+  if (( INTERRUPTED )); then
+    echo "Compaction interrupted; the history is unchanged." >&2
+    return 1
+  fi
+  result=$(assemble)
+  if ! summary=$(jq -er '(.message.content // "") | gsub("^\\s+|\\s+$"; "")
+                         | select(. != "")' <<<"$result"); then
+    printf 'Could not compact: %s\n' "$(jq -r '(.error // "empty reply")
+      | if type == "object" then (.message // tojson) else tostring end' <<<"$result")" >&2
+    return 1
+  fi
+  before=$(printf '%s' "$MESSAGES" | wc -c)
+  [[ -f "$(session_file)" ]] &&
+    cp -f "$(session_file)" "$(session_file).bak" 2>/dev/null
+  MESSAGES=$(jq -cn --arg s "$SYSTEM" --arg sum "$summary" '
+      [{role: "system", content: $s},
+       {role: "user",
+        content: "Summary of the conversation so far (everything before it was compacted to save context):\n\n" + $sum}]')
+  save_session
+  after=$(printf '%s' "$MESSAGES" | wc -c)
+  printf '(compacted %s messages, %s bytes -> one summary, %s bytes)\n' \
+    "$count" "$before" "$after"
+}
+
+# Compacts on its own once the history outgrows COMPACT_AT bytes. Never fatal:
+# if the summary cannot be had, the turn goes ahead with the history as it is.
+auto_compact() {
+  local size n
+  (( AUTO_COMPACT )) || return 0
+  size=$(printf '%s' "$MESSAGES" | wc -c)
+  (( size > COMPACT_AT )) || return 0
+  n=$(jq '[.[] | select(.role != "system")] | length' <<<"$MESSAGES" 2>/dev/null) || n=0
+  (( n > 0 )) || return 0             # only the system prompt: nothing to fold
+  printf '(history is %s bytes; compacting it first)\n' "$size" >&2
+  compact || printf '(compaction failed; carrying on)\n' >&2
+  return 0
 }
 
 # ---------------------------------------------------------------- tools
@@ -492,16 +571,20 @@ while true; do
               load_session "$arg" || true
             fi ;;
     /about) about ;;
+    /compact) compact || true ;;
     /reset) SESSION_ID=$(new_id); new_history; echo "New session $SESSION_ID." ;;
     /auto)  if [[ "$AUTO" == 1 ]]; then AUTO=0; echo "Commands need confirmation."
             else AUTO=1; echo "Commands run WITHOUT confirmation."; fi ;;
     /help)  echo "/about           version, author, model and session details"
+            echo "/compact         summarize the conversation to free up context"
+            echo "                 (automatic above $COMPACT_AT bytes; AUTO_COMPACT=0 disables)"
             echo "/sessions [all]  list saved sessions (this directory, or all)"
             echo "/resume ID       switch to a saved session (id or unique prefix)"
             echo "/reset           start a new session (the old one stays resumable)"
             echo "/auto            toggle running commands without confirmation (now: $AUTO)"
             echo "/exit            quit (or Ctrl-D)" ;;
-    *) append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"
+    *) auto_compact          # must run before the new message joins the history
+       append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"
        run_turn ;;
   esac
   input=""
