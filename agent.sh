@@ -2,9 +2,10 @@
 # vim: set ts=2 sw=2 sts=2 et ai tw=80 cc=80 ft=sh :
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
-# Usage: agent.sh [-y] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
+# Usage: agent.sh [-y] [-p] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
 #        agent.sh -l [all]
 #   -y       run commands without asking (same as AUTO=1)
+#   -p       start in plan mode: read-only commands, no edits (/build)
 #   -c       continue the most recent session in this directory
 #   -r ID    resume a specific session (full id or a unique prefix)
 #   -l       list saved sessions for this directory ("all": every directory)
@@ -13,11 +14,13 @@
 #   prompt   optional first message (put -- before one that starts with '-')
 #
 # REPL commands: /help  /about  /compact  /sessions [all]  /resume ID
-#                /reset  /auto  /exit (or Ctrl-D)
+#                /reset  /auto  /plan  /build  /exit (or Ctrl-D)
+# There are two modes. Build (the default) edits files and runs commands.
+# Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off); /compact does it on demand.
-# The built-in prompts can be replaced by SYSTEM.md and COMPACTION.md in
-# ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in one,
+# The built-in prompts can be replaced by SYSTEM.md, COMPACTION.md and PLAN.md
+# in ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in,
 # and {{cwd}} in a file is replaced by the working directory.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
@@ -26,6 +29,7 @@ set -euo pipefail
 MODEL="${MODEL:-deepseek-v4.1-flash}"
 URL="${URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 AUTO="${AUTO:-0}"                          # 1 = no confirmation prompt
+MODE="${MODE:-build}"                      # build (edits) or plan (read-only)
 MAX_OUT="${MAX_OUT:-20000}"                # tool output bytes sent to the model
 AUTO_COMPACT="${AUTO_COMPACT:-1}"          # 1 = auto-summarize a long history
 COMPACT_AT="${COMPACT_AT:-100000}"         # history bytes that trigger that
@@ -62,7 +66,7 @@ read_prompt() {
 # Which prompts are in use, for /about
 prompt_notes() {
   local f n=""
-  for f in SYSTEM.md COMPACTION.md; do
+  for f in SYSTEM.md COMPACTION.md PLAN.md; do
     [[ -n "$(read_prompt "$f" '')" ]] && n+="${n:+, }$f"
   done
   if [[ -n "$n" ]]; then printf '%s from %s' "$n" "$PROMPT_DIR"
@@ -112,6 +116,11 @@ about() {
   printf '  %-9s %s\n' endpoint "$URL"
   printf '  %-9s %s\n' sessions "$SESSION_DIR"
   printf '  %-9s %s\n' auto "$run"
+  if [[ "$MODE" == plan ]]; then
+    printf '  %-9s %s\n' mode 'plan (read-only commands, no edits)'
+  else
+    printf '  %-9s %s\n' mode 'build (edits and commands allowed)'
+  fi
   if (( AUTO_COMPACT )); then
     printf '  %-9s automatic above %s bytes\n' compact "$COMPACT_AT"
   else
@@ -129,12 +138,15 @@ for arg in "$@"; do                    # getopts cannot see long options
   case "$arg" in
     -h|--help) usage; exit 0 ;;
     --version) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
+    --plan) MODE=plan ;;
+    --build) MODE=build ;;
     --) break ;;
   esac
 done
-while getopts ":ycr:lhV" opt; do
+while getopts ":ycr:lhVp" opt; do
   case "$opt" in
     y) AUTO=1 ;;
+    p) MODE=plan ;;
     c) RESUME=last ;;
     r) [[ -n "$OPTARG" ]] ||
          { echo "agent.sh: -r needs a session id" >&2; exit 2; }
@@ -149,6 +161,10 @@ done
 shift $((OPTIND - 1))
 if (( LIST )); then list_sessions "${1:-}"; exit 0; fi
 FIRST_PROMPT="$*"
+case "$MODE" in
+  build|plan) ;;
+  *) echo "agent.sh: MODE must be 'build' or 'plan'" >&2; exit 2 ;;
+esac
 
 : "${OPENCODE_API_KEY:?Please export OPENCODE_API_KEY}"
 for dep in jq curl; do
@@ -161,7 +177,17 @@ SYSTEM_DEFAULT="You are a coding agent working in the user's current directory
 runs in a fresh non-interactive bash process with no stdin, so 'cd' and
 variables do not persist between calls and interactive programs will not work.
 Be concise."
-SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
+PLAN_DEFAULT='PLAN MODE: plan only, do not change anything. Inspect the '
+PLAN_DEFAULT+='project with read-only commands (ls, cat, head, tail, grep, '
+PLAN_DEFAULT+='git status/diff/log/show, ...); other commands are refused '
+PLAN_DEFAULT+='by the harness. Do not edit, create or delete files, commit '
+PLAN_DEFAULT+='or run builds and tests that touch the tree. Finish with a '
+PLAN_DEFAULT+='concrete, step-by-step plan: the files to change, the exact '
+PLAN_DEFAULT+='edits, and how to verify them. Say what you would do, not '
+PLAN_DEFAULT+='what you did.'
+BASE_SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
+PLAN_PROMPT=$(read_prompt PLAN.md "$PLAN_DEFAULT")
+SYSTEM="$BASE_SYSTEM"
 
 # OpenAI-style tool definition
 # Built with jq: a JSON string cannot be broken across lines
@@ -197,6 +223,18 @@ save_session() {
 
 new_history() {
   MESSAGES=$(jq -cn --arg s "$SYSTEM" '[{role: "system", content: $s}]')
+}
+
+# Switches mode and keeps the system message at the head of the history in
+# step, so the model sees the rules of the mode the user is in.
+apply_mode() {
+  MODE="$1"
+  SYSTEM="$BASE_SYSTEM"
+  [[ "$MODE" == plan ]] && SYSTEM+=$'\n\n'"$PLAN_PROMPT"
+  [[ -n "${MESSAGES:-}" ]] || return 0
+  MESSAGES=$(jq -c --arg s "$SYSTEM" '
+    if (.[0].role // "") == "system" then .[0].content = $s else . end' \
+    <<<"$MESSAGES") || true
 }
 
 # Most recently saved session whose cwd is this directory
@@ -281,6 +319,7 @@ else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
   new_history
 fi
+apply_mode "$MODE"
 
 # Append one JSON message and save. Everything goes through stdin, never argv:
 # a single argv string is capped at 128 KiB on Linux.
@@ -486,11 +525,94 @@ auto_compact() {
 
 # ---------------------------------------------------------------- tools
 
+# Plan mode may only inspect. This is a guard, not a sandbox: it refuses
+# redirections, substitutions and anything whose first word it does not know.
+PLAN_CMDS=(ls cat head tail wc grep egrep fgrep rg find file stat pwd echo
+           printf cut tr diff comm cmp jq basename dirname readlink realpath
+           du df which type uname date id ps seq nl od strings paste join
+           expand unexpand fold tac rev sort tree md5sum sha1sum sha256sum
+           sha512sum cksum test true false '[' '[[' : cd)
+
+# git is allowed only for subcommands that do not change the repository
+plan_git_ok() {
+  local -a w; local i=1 sub=""
+  # -c / --config-env can define aliases and pagers that run commands
+  case " $1 " in
+    *" --output"*|*" -c "*|*" --config-env"*) return 1 ;;
+    *" -O "*|*" --open-files-in-pager"*) return 1 ;;
+  esac
+  read -ra w <<<"$1"
+  while (( i < ${#w[@]} )); do
+    case "${w[i]}" in
+      -C|-c) (( i += 2 )) ;;
+      -*)    (( i += 1 )) ;;
+      *)     sub=${w[i]}; break ;;
+    esac
+  done
+  case "$sub" in
+    status|diff|log|show|blame|ls-files|ls-tree|ls-remote|rev-parse|grep|\
+    cat-file|show-ref|shortlog|describe|for-each-ref)
+      return 0 ;;
+    branch) case "${w[i+1]:-}" in
+              ""|-a|-r|-v|-vv|--list|--show-current|--contains|--merged)
+                return 0 ;;
+              *) return 1 ;;
+            esac ;;
+    tag) case "${w[i+1]:-}" in ""|-l|--list|-n*) return 0 ;;
+            *) return 1 ;; esac ;;
+    remote) case "${w[i+1]:-}" in ""|-v|--verbose|show|get-url) return 0 ;;
+            *) return 1 ;; esac ;;
+    config) case "${w[i+1]:-}" in
+              -l|--list|--get|--get-all|--get-regexp|--get-urlmatch) return 0 ;;
+              *) return 1 ;;
+            esac ;;
+    stash) case "${w[i+1]:-}" in list|show) return 0 ;; *) return 1 ;; esac ;;
+    reflog) case "${w[i+1]:-}" in ""|show) return 0 ;; *) return 1 ;; esac ;;
+    worktree|submodule) case "${w[i+1]:-}" in
+              list|status|summary) return 0 ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+plan_allows() {
+  local cmd="$1" frag w c open="\$(" ok=""
+  case "$cmd" in *'>'*|*'<'*|*'`'*|*"$open"*) return 1 ;; esac
+  while IFS= read -r frag; do
+    frag=${frag#"${frag%%[![:space:]]*}"}
+    [[ -z "$frag" ]] && continue
+    w=${frag%%[[:space:]]*}
+    case "$w" in
+      git) plan_git_ok "$frag" || return 1; continue ;;
+      find) case " $frag " in
+              *" -delete "*|*" -exec "*|*" -execdir "*|*" -ok "*|*" -fprint"*)
+                return 1 ;;
+            esac ;;
+      sort|tree) case " $frag " in
+              *" -o "*|*" --output "*|*--output=*) return 1 ;;
+            esac ;;
+      date) case " $frag " in *" -s "*|*" --set"*) return 1 ;; esac ;;
+      rg) case " $frag " in *" --pre "*|*" --pre="*) return 1 ;; esac ;;
+    esac
+    ok=""
+    for c in "${PLAN_CMDS[@]}"; do
+      [[ "$c" == "$w" ]] && { ok=1; break; }
+    done
+    [[ -n "$ok" ]] || return 1
+  done < <(printf '%s\n' "$cmd" | tr ';|&' '\n')
+  return 0
+}
+
 # Runs one command; result goes in TOOL_OUT (no subshell, so Ctrl-C state
 # survives)
 run_tool() {
   local cmd="$1" ok="" rc=0 out size half note=""
   printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
+  if [[ "$MODE" == plan ]] && ! plan_allows "$cmd"; then
+    TOOL_OUT="Plan mode: command not run. Only read-only inspection"
+    TOOL_OUT+=" commands are allowed here; /build leaves plan mode."
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&2
+    return
+  fi
   if [[ "$AUTO" != 1 ]]; then
     if ! { true </dev/tty; } 2>/dev/null; then   # nothing to ask the user on
       TOOL_OUT="The user declined to run this command (no terminal to ask"
@@ -643,7 +765,12 @@ while true; do
     # line).
     # The fork inherits the history list, so Up arrow still works.
     # \001 \002 mark the color codes as zero-width for readline
-    prompt_text=$'\n\001\033[36m\002'"$SESSION_ID"$'$\001\033[0m\002 '
+    if [[ "$MODE" == plan ]]; then
+      prompt_text=$'\n\001\033[35m\002plan\001\033[0m\002 '
+    else
+      prompt_text=$'\n'
+    fi
+    prompt_text+=$'\001\033[36m\002'"$SESSION_ID"$'$\001\033[0m\002 '
     input=$(trap - INT
             IFS= read -erp "$prompt_text" line &&
             printf '%s' "$line") || rc=$?
@@ -674,6 +801,18 @@ while true; do
             else
               AUTO=1; echo "Commands run WITHOUT confirmation."
             fi ;;
+    /plan)  if [[ "$MODE" == plan ]]; then
+              echo "Already in plan mode."
+            else
+              apply_mode plan
+              echo "Plan mode: inspect only, no edits (/build to leave)."
+            fi ;;
+    /build) if [[ "$MODE" == build ]]; then
+              echo "Already in build mode."
+            else
+              apply_mode build
+              echo "Build mode: commands run and files can change."
+            fi ;;
     /help)  echo "/about           version, author, model and session details"
             echo "/compact         summarize the conversation to free up"\
                  "context"
@@ -687,6 +826,8 @@ while true; do
                  "resumable)"
             echo "/auto            toggle running commands without"\
                  "confirmation (now: $AUTO)"
+            echo "/plan            plan only: read-only commands, no edits"
+            echo "/build           leave plan mode and allow edits again"
             echo "/exit            quit (or Ctrl-D)" ;;
     *) auto_compact          # must run before the new message joins the history
        append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"

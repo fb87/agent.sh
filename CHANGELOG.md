@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Plan mode (`-p`, `--plan`, `MODE=plan`, REPL `/plan`): the agent may only
+  run read-only inspection commands; edits and other state-changing commands
+  are refused. `/build` (or `--build`) returns to the default build mode.
+
 ## [0.1.0] - 2026-11-13
 
 First public release: a single-file coding agent in bash, talking to an
