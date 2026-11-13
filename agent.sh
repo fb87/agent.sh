@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
-# Usage: agent.sh [-y] [-c | -r SESSION_ID] [-h] [prompt...]
+# Usage: agent.sh [-y] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
 #        agent.sh -l [all]
 #   -y       run commands without asking (same as AUTO=1)
 #   -c       continue the most recent session in this directory
 #   -r ID    resume a specific session (full id or a unique prefix)
 #   -l       list saved sessions for this directory ("all": every directory)
 #   -h       show this help (--help works too)
+#   -V       show the version (--version works too)
 #   prompt   optional first message (put -- before one that starts with '-')
 #
-# REPL commands: /help  /sessions [all]  /resume ID  /reset  /auto  /exit (or Ctrl-D)
+# REPL commands: /help  /about  /sessions [all]  /resume ID  /reset  /auto  /exit (or Ctrl-D)
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
@@ -24,6 +25,10 @@ SHOW_REASONING="${SHOW_REASONING:-1}"               # 1 = stream reasoning (dimm
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
 AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"      # lines kept in that file
 SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent.sh/sessions}"
+
+VERSION="0.1.0"
+RELEASED="2026-11-13"
+AUTHOR="fb87"                                       # see LICENSE
 
 new_id() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "bash-agent-$$-$(date +%s)"; }
 
@@ -53,12 +58,34 @@ list_sessions() {
 
 usage() { sed -n '4,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
 
+# Version and environment details (REPL: /about, CLI: -V or --version)
+about() {
+  local jq_ver curl_ver run
+  jq_ver=$(jq --version 2>/dev/null); jq_ver=${jq_ver/jq-/jq }
+  curl_ver=$(curl --version 2>/dev/null | head -1 | cut -d' ' -f1,2)
+  if [[ "$AUTO" == 1 ]]; then run="run without asking"; else run="ask first"; fi
+  printf 'agent.sh %s — a coding agent in bash\n' "$VERSION"
+  printf '  %-9s %s\n' author "$AUTHOR"
+  printf '  %-9s %s\n' released "$RELEASED"
+  printf '  %-9s MIT (see LICENSE)\n' license
+  printf '  %-9s %s\n' model "$MODEL"
+  printf '  %-9s %s\n' endpoint "$URL"
+  printf '  %-9s %s\n' sessions "$SESSION_DIR"
+  printf '  %-9s %s\n' auto "$run"
+  printf '  %-9s %s, %s, %s\n' runtime "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
+  printf '  %-9s %s\n' script "$0"
+}
+
 RESUME=""
 LIST=0
 for arg in "$@"; do                    # getopts cannot see long options
-  case "$arg" in -h|--help) usage; exit 0 ;; --) break ;; esac
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+    --version) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
+    --) break ;;
+  esac
 done
-while getopts ":ycr:lh" opt; do
+while getopts ":ycr:lhV" opt; do
   case "$opt" in
     y) AUTO=1 ;;
     c) RESUME=last ;;
@@ -66,6 +93,7 @@ while getopts ":ycr:lh" opt; do
        RESUME="$OPTARG" ;;
     l) LIST=1 ;;
     h) usage; exit 0 ;;
+    V) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
     :) echo "agent.sh: -$OPTARG needs an argument" >&2; exit 2 ;;
     *) echo "agent.sh: unknown option -$OPTARG (try -h)" >&2; exit 2 ;;
   esac
@@ -463,14 +491,16 @@ while true; do
             else
               load_session "$arg" || true
             fi ;;
+    /about) about ;;
     /reset) SESSION_ID=$(new_id); new_history; echo "New session $SESSION_ID." ;;
     /auto)  if [[ "$AUTO" == 1 ]]; then AUTO=0; echo "Commands need confirmation."
             else AUTO=1; echo "Commands run WITHOUT confirmation."; fi ;;
-    /help)  echo "/sessions [all]  list saved sessions (this directory, or all)"
+    /help)  echo "/about           version, author, model and session details"
+            echo "/sessions [all]  list saved sessions (this directory, or all)"
             echo "/resume ID       switch to a saved session (id or unique prefix)"
-            echo "/reset  start a new session (the old one stays resumable)"
-            echo "/auto   toggle running commands without confirmation (now: $AUTO)"
-            echo "/exit   quit (or Ctrl-D)" ;;
+            echo "/reset           start a new session (the old one stays resumable)"
+            echo "/auto            toggle running commands without confirmation (now: $AUTO)"
+            echo "/exit            quit (or Ctrl-D)" ;;
     *) append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"
        run_turn ;;
   esac
