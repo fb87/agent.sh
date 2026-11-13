@@ -16,7 +16,8 @@
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off); /compact does it on demand.
 # The built-in prompts can be replaced by SYSTEM.md and COMPACTION.md in
-# ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in one.
+# ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in one,
+# and {{cwd}} in a file is replaced by the working directory.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
@@ -40,12 +41,16 @@ AUTHOR="fb87"                                       # see LICENSE
 
 new_id() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "bash-agent-$$-$(date +%s)"; }
 
-# The text of $PROMPT_DIR/$1 when that file exists and is not blank, else $2
+# The text of $PROMPT_DIR/$1 when that file exists and is not blank, else $2.
+# {{cwd}} in it stands for the working directory (the file cannot expand it).
 read_prompt() {
-  local f="$PROMPT_DIR/$1" t=""
+  local f="$PROMPT_DIR/$1" t="" ph='{{cwd}}' i=0
   [[ -f "$f" ]] && t=$(cat "$f" 2>/dev/null)
   t=${t#"${t%%[![:space:]]*}"}            # trim, so a blank file falls back too
   t=${t%"${t##*[![:space:]]}"}
+  while [[ "$t" == *"$ph"* ]] && (( i++ < 100 )); do
+    t="${t%%"$ph"*}${PWD}${t#*"$ph"}"
+  done
   printf '%s' "${t:-$2}"
 }
 
