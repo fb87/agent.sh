@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plan mode (`-p`, `--plan`, `MODE=plan`, REPL `/plan`): the agent may only
   run read-only inspection commands; edits and other state-changing commands
   are refused. `/build` (or `--build`) returns to the default build mode.
+- `/model` shows the model name, reasoning effort, thinking and temperature;
+  `/model set <model|reasoning|thinking|temperature> <value>` changes one for
+  the current run (also `MODEL`, `REASONING`, `THINKING`, `TEMPERATURE` in the
+  environment). Defaults keep the request unchanged: `low` reasoning, no
+  `thinking` and no `temperature` field.
 
 ## [0.1.0] - 2026-11-13
 

@@ -13,8 +13,12 @@
 #   -V       show the version (--version works too)
 #   prompt   optional first message (put -- before one that starts with '-')
 #
-# REPL commands: /help  /about  /compact  /sessions [all]  /resume ID
-#                /reset  /auto  /plan  /build  /exit (or Ctrl-D)
+# REPL commands: /help  /about  /model  /compact  /sessions [all]
+#                /resume ID  /reset  /auto  /plan  /build  /exit (Ctrl-D)
+# /model shows the model, reasoning effort, thinking and temperature;
+# /model set temperature 0.1 (or reasoning medium, thinking off) changes one
+# for this run, as do the MODEL, REASONING, THINKING and TEMPERATURE
+# environment variables.
 # There are two modes. Build (the default) edits files and runs commands.
 # Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
@@ -27,6 +31,9 @@
 set -euo pipefail
 
 MODEL="${MODEL:-deepseek-v4.1-flash}"
+REASONING="${REASONING:-low}"              # reasoning effort ("" = omit)
+THINKING="${THINKING:-}"                   # on/off ("" = server default)
+TEMPERATURE="${TEMPERATURE:-}"             # 0..2 ("" = server default)
 URL="${URL:-https://opencode.ai/zen/go/v1/chat/completions}"
 AUTO="${AUTO:-0}"                          # 1 = no confirmation prompt
 MODE="${MODE:-build}"                      # build (edits) or plan (read-only)
@@ -102,6 +109,70 @@ list_sessions() {
 
 usage() { sed -n '4,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
 
+# The current model settings (REPL: /model or /model info)
+model_info() {
+  printf '  %-11s %s\n' model "$MODEL"
+  printf '  %-11s %s\n' reasoning "${REASONING:-server default}"
+  printf '  %-11s %s\n' thinking "${THINKING:-server default}"
+  printf '  %-11s %s\n' temperature "${TEMPERATURE:-server default}"
+  printf '  %-11s %s\n' endpoint "$URL"
+  printf 'Change one with: /model set <model|reasoning|thinking|'\
+'temperature> <value>\n'
+}
+
+# /model set <key> <value>: validates and stores one setting for this run
+set_model() {
+  local key="${1:-}" val="${2:-}" rest="${3:-}"
+  case "$key" in
+    temp)   key=temperature ;;
+    effort) key=reasoning ;;
+  esac
+  case "$key" in
+    model|reasoning|thinking|temperature) ;;
+    "") echo "Usage: /model set <model|reasoning|thinking|temperature>"\
+             "<value>"; return 0 ;;
+    *)  echo "Unknown setting '$key' (model, reasoning, thinking or"\
+             "temperature)."; return 0 ;;
+  esac
+  if [[ -z "$val" || -n "$rest" ]]; then
+    printf 'Usage: /model set %s <value>\n' "$key"; return 0
+  fi
+  case "$key" in
+    model) MODEL="$val" ;;
+    reasoning)
+      case "$val" in
+        minimal|low|medium|high) REASONING="$val" ;;
+        default|off|none)        REASONING="" ;;
+        *)  echo "Reasoning must be minimal, low, medium, high or default."
+            return 0 ;;
+      esac ;;
+    thinking)
+      case "$val" in
+        on|yes|true|1|enabled)   THINKING=on ;;
+        off|no|false|0|disabled) THINKING=off ;;
+        default|auto)            THINKING="" ;;
+        *)  printf 'Thinking must be on, off or default.\n'; return 0 ;;
+      esac ;;
+    temperature)
+      if [[ "$val" == default ]]; then
+        TEMPERATURE=""
+      elif jq -en --arg t "$val" \
+           '($t | tonumber?) as $n | $n != null and $n >= 0 and $n <= 2' \
+           >/dev/null 2>&1; then
+        TEMPERATURE="$val"
+      else
+        printf 'Temperature must be a number from 0 to 2, or default.\n'
+        return 0
+      fi ;;
+  esac
+  case "$key" in
+    model)       printf 'model = %s\n' "$MODEL" ;;
+    reasoning)   printf 'reasoning = %s\n' "${REASONING:-server default}" ;;
+    thinking)    printf 'thinking = %s\n' "${THINKING:-server default}" ;;
+    temperature) printf 'temperature = %s\n' "${TEMPERATURE:-server default}" ;;
+  esac
+}
+
 # Version and environment details (REPL: /about, CLI: -V or --version)
 about() {
   local jq_ver curl_ver run
@@ -113,6 +184,9 @@ about() {
   printf '  %-9s %s\n' released "$RELEASED"
   printf '  %-9s MIT (see LICENSE)\n' license
   printf '  %-9s %s\n' model "$MODEL"
+  printf '  %-9s reasoning %s, thinking %s, temperature %s\n' params \
+    "${REASONING:-default}" "${THINKING:-default}" \
+    "${TEMPERATURE:-default}"
   printf '  %-9s %s\n' endpoint "$URL"
   printf '  %-9s %s\n' sessions "$SESSION_DIR"
   printf '  %-9s %s\n' auto "$run"
@@ -434,8 +508,16 @@ http_post() {
 request() {
   local msgs="$1" quiet="${2:-}" attempt code body
   body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-    --arg mode "$quiet" \
-    '{model: $model, reasoning_effort: "low", messages: ., stream: true}
+    --arg mode "$quiet" --arg reasoning "$REASONING" \
+    --arg thinking "$THINKING" --arg temperature "$TEMPERATURE" \
+    '{model: $model}
+     + (if $reasoning == "" then {} else {reasoning_effort: $reasoning} end)
+     + (if $thinking == "" then {}
+        else {thinking: {type: (if $thinking == "on" then "enabled"
+                                 else "disabled" end)}} end)
+     + (if $temperature == "" then {}
+        else {temperature: ($temperature | tonumber)} end)
+     + {messages: ., stream: true}
      + (if $mode == "quiet" then {} else {tools: $tools} end)' <<<"$msgs")
   for attempt in 1 2 3 4; do
     : >"$TMP/sse"; : >"$TMP/hdr"
@@ -793,6 +875,11 @@ while true; do
               load_session "$arg" || true
             fi ;;
     /about) about ;;
+    /model|"/model info") model_info ;;
+    "/model set"|"/model set "*)
+            read -r key val rest _ <<<"${input#/model set}" || true
+            set_model "${key:-}" "${val:-}" "${rest:-}" ;;
+    "/model "*) echo "Usage: /model [info] | /model set <key> <value>" ;;
     /compact) compact || true ;;
     /reset) SESSION_ID=$(new_id); new_history
             echo "New session $SESSION_ID." ;;
@@ -814,6 +901,10 @@ while true; do
               echo "Build mode: commands run and files can change."
             fi ;;
     /help)  echo "/about           version, author, model and session details"
+            echo "/model           model settings: name, reasoning,"\
+                 "thinking, temperature"
+            echo "                 (/model set temperature 0.1, /model"\
+                 " set reasoning medium)"
             echo "/compact         summarize the conversation to free up"\
                  "context"
             echo "                 (automatic above $COMPACT_AT bytes;"\
