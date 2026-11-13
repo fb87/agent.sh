@@ -23,30 +23,59 @@
 # Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off); /compact does it on demand.
-# The built-in prompts can be replaced by SYSTEM.md, COMPACTION.md and PLAN.md
-# in ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in,
-# and {{cwd}} in a file is replaced by the working directory.
+# Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
+# "model", "url" and "api_key" (plus reasoning, thinking and temperature).
+# Environment variables win over that file.
+# The built-in prompts can be replaced by SYSTEM.md, COMPACTION.md and PLAN.md.
+# They are looked up in $PROMPT_DIR (if set), then in
+# $XDG_CONFIG_HOME/agent.sh/prompts, then in <install dir>/pro.mpts; a missing
+# or blank file keeps the built-in, and {{cwd}} is the working directory.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
 
-MODEL="${MODEL:-deepseek-v4.1-flash}"
-REASONING="${REASONING:-low}"              # reasoning effort ("" = omit)
-THINKING="${THINKING:-}"                   # on/off ("" = server default)
-TEMPERATURE="${TEMPERATURE:-}"             # 0..2 ("" = server default)
-URL="${URL:-https://opencode.ai/zen/go/v1/chat/completions}"
-AUTO="${AUTO:-0}"                          # 1 = no confirmation prompt
-MODE="${MODE:-build}"                      # build (edits) or plan (read-only)
-MAX_OUT="${MAX_OUT:-20000}"                # tool output bytes sent to the model
-AUTO_COMPACT="${AUTO_COMPACT:-1}"          # 1 = auto-summarize a long history
-COMPACT_AT="${COMPACT_AT:-100000}"         # history bytes that trigger that
-TIMEOUT="${TIMEOUT:-300}"                  # seconds of silence before giving up
-SHOW_REASONING="${SHOW_REASONING:-1}"      # 1 = stream reasoning (dimmed)
+# Which settings came from the environment: a config file must not override an
+# explicit environment variable. ${VAR+x} also distinguishes unset from set
+# to the empty string, which matters for REASONING and friends.
+MODEL_ENV_SET=${MODEL+1};              MODEL_ENV="${MODEL-}"
+PROVIDER_ENV_SET=${PROVIDER+1};        PROVIDER_ENV="${PROVIDER-}"
+URL_ENV_SET=${URL+1};                  URL_ENV="${URL-}"
+REASONING_ENV_SET=${REASONING+1};      REASONING_ENV="${REASONING-}"
+THINKING_ENV_SET=${THINKING+1};        THINKING_ENV="${THINKING-}"
+TEMPERATURE_ENV_SET=${TEMPERATURE+1};  TEMPERATURE_ENV="${TEMPERATURE-}"
+AGENT_API_KEY_ENV_SET=${AGENT_API_KEY+1}
+AGENT_API_KEY_ENV="${AGENT_API_KEY-}"
+OPENCODE_API_KEY_ENV_SET=${OPENCODE_API_KEY+1}
+OPENCODE_API_KEY_ENV="${OPENCODE_API_KEY-}"
+
+MODEL="deepseek-v4.1-flash"            # can come from config or environment
+PROVIDER="opencode"                    # opencode (aka opencode-go)
+URL=""                                 # default is the provider's endpoint
+REASONING="low"                        # reasoning effort ("" = omit the field)
+THINKING=""                            # on/off ("" = server default)
+TEMPERATURE=""                         # 0..2 ("" = server default)
+AUTO="${AUTO:-0}"                      # 1 = no confirmation prompt
+MODE="${MODE:-build}"                  # build (edits) or plan (read-only)
+MAX_OUT="${MAX_OUT:-20000}"            # tool output bytes sent to the model
+AUTO_COMPACT="${AUTO_COMPACT:-1}"      # 1 = auto-summarize a long history
+COMPACT_AT="${COMPACT_AT:-100000}"     # history bytes that trigger that
+TIMEOUT="${TIMEOUT:-300}"              # seconds of silence before giving up
+SHOW_REASONING="${SHOW_REASONING:-1}"  # 1 = stream reasoning (dimmed)
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
 AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"   # lines kept in that file
 SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}\
 /agent.sh/sessions}"
-PROMPT_DIR="${PROMPT_DIR:-./pro.mpts}"     # optional prompt overrides
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_DIR="${AGENT_CONFIG_DIR:-$XDG_CONFIG_HOME/agent.sh}"
+CONFIG_FILE="${AGENT_CONFIG:-$CONFIG_DIR/config.json}"
+SYSTEM_CONFIG_FILE="${AGENT_SYSTEM_CONFIG:-/etc/agent.sh/config.json}"
+PROMPT_DIR="${PROMPT_DIR-}"            # explicit prompt directory, if set
+PROMPT_DIRS=()                         # search path, filled by the function
+PROMPT_FROM="built-in"                 # set by read_prompt
+INSTALL_DIR=""                         # directory containing agent.sh
+API_KEY=""                             # set by load_settings
+API_KEY_SOURCE=""
+CONFIG_LOADED=0
 
 VERSION="0.2.0"
 RELEASED="2026-11-13"
@@ -57,27 +86,188 @@ new_id() {
     echo "bash-agent-$$-$(date +%s)"
 }
 
-# The text of $PROMPT_DIR/$1 when that file exists and is not blank, else $2.
-# {{cwd}} in it stands for the working directory (the file cannot expand it).
+# The directory the script lives in, with symlinks resolved, so a symlink in
+# ~/.local/bin or a Nix wrapper still finds the bundled pro.mpts directory.
+resolve_install_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || break
+    src=$(readlink "$src" 2>/dev/null) || break
+    [[ "$src" == /* ]] || src="$dir/$src"
+  done
+  dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || dir="."
+  printf '%s' "$dir"
+}
+
+# The endpoint for a known provider; fails for one we do not know.
+provider_url() {
+  case "$1" in
+    opencode|opencode-go)
+      printf '%s' 'https://opencode.ai/zen/go/v1/chat/completions' ;;
+    *) return 1 ;;
+  esac
+}
+
+# One top-level string/number/boolean field of a JSON config; empty if absent.
+config_get() {
+  jq -r --arg k "$2" '
+    if type == "object" then .[$k] // empty else empty end
+    | if type == "string" then .
+      elif type == "number" or type == "boolean" then tojson
+      else empty end' "$1" 2>/dev/null
+}
+
+# Applies one config file; a later file overrides an earlier one.
+load_config_file() {
+  local f="$1" v
+  [[ -f "$f" ]] || return 0
+  if ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    printf 'agent.sh: %s is not a JSON object\n' "$f" >&2
+    exit 2
+  fi
+  v=$(config_get "$f" provider)
+  if [[ -n "$v" ]]; then PROVIDER="$v"; fi
+  v=$(config_get "$f" model)
+  if [[ -n "$v" ]]; then MODEL="$v"; fi
+  v=$(config_get "$f" url)
+  if [[ -n "$v" ]]; then URL="$v"; fi
+  v=$(config_get "$f" api_key)
+  if [[ -n "$v" ]]; then API_KEY="$v"; API_KEY_SOURCE="config"; fi
+  v=$(config_get "$f" reasoning)
+  if [[ -n "$v" ]]; then
+    case "$v" in
+      default|off|none) REASONING="" ;;
+      *) REASONING="$v" ;;
+    esac
+  fi
+  v=$(config_get "$f" thinking)
+  if [[ -n "$v" ]]; then
+    case "$v" in
+      default|auto) THINKING="" ;;
+      *) THINKING="$v" ;;
+    esac
+  fi
+  v=$(config_get "$f" temperature)
+  if [[ -n "$v" ]]; then TEMPERATURE="$v"; fi
+}
+
+# Config file(s) first, then the environment, then defaults. Refuses settings
+# that cannot work instead of sending a bad request later.
+load_settings() {
+  load_config_file "$SYSTEM_CONFIG_FILE"
+  load_config_file "$CONFIG_FILE"
+  if [[ -f "$CONFIG_FILE" ]]; then CONFIG_LOADED=1; fi
+
+  if [[ -n "$PROVIDER_ENV_SET" ]]; then PROVIDER="$PROVIDER_ENV"; fi
+  if [[ -n "$URL_ENV_SET" ]]; then URL="$URL_ENV"; fi
+  if [[ -n "$MODEL_ENV_SET" ]]; then MODEL="$MODEL_ENV"; fi
+  if [[ -n "$REASONING_ENV_SET" ]]; then REASONING="$REASONING_ENV"; fi
+  if [[ -n "$THINKING_ENV_SET" ]]; then THINKING="$THINKING_ENV"; fi
+  if [[ -n "$TEMPERATURE_ENV_SET" ]]; then
+    TEMPERATURE="$TEMPERATURE_ENV"
+  fi
+  if [[ -n "$OPENCODE_API_KEY_ENV_SET" ]]; then
+    API_KEY="$OPENCODE_API_KEY_ENV"
+    API_KEY_SOURCE="env OPENCODE_API_KEY"
+  fi
+  if [[ -n "$AGENT_API_KEY_ENV_SET" ]]; then
+    API_KEY="$AGENT_API_KEY_ENV"
+    API_KEY_SOURCE="env AGENT_API_KEY"
+  fi
+  if [[ -z "$MODEL" ]]; then
+    printf 'agent.sh: model must not be empty\n' >&2
+    exit 2
+  fi
+  if [[ -z "$API_KEY" ]]; then
+    printf '%s %s\n' \
+      'agent.sh: no API key: set AGENT_API_KEY or OPENCODE_API_KEY,' \
+      "or \"api_key\" in $CONFIG_FILE" >&2
+    exit 2
+  fi
+  if [[ -z "$URL" ]]; then
+    if ! URL=$(provider_url "$PROVIDER"); then
+      printf 'agent.sh: unknown provider "%s"; set "url" in %s\n' \
+        "$PROVIDER" "$CONFIG_FILE" >&2
+      exit 2
+    fi
+  fi
+  case "$REASONING" in
+    minimal|low|medium|high|"") ;;
+    *) printf '%s\n' \
+         'agent.sh: reasoning must be minimal, low, medium, high or default' \
+         >&2
+       exit 2 ;;
+  esac
+  case "$THINKING" in
+    on|off|"") ;;
+    *) printf 'agent.sh: thinking must be on, off or default\n' >&2
+       exit 2 ;;
+  esac
+  if [[ -n "$TEMPERATURE" ]] && ! jq -en --arg t "$TEMPERATURE" \
+       '($t | tonumber?) as $n | $n != null and $n >= 0 and $n <= 2' \
+       >/dev/null 2>&1; then
+    printf 'agent.sh: temperature must be a number from 0 to 2\n' >&2
+    exit 2
+  fi
+}
+
+# A config file with an API key should not be readable by other users. This is
+# only a warning: the key may be intentional, e.g. a shared service account.
+warn_config_permissions() {
+  local f="$CONFIG_FILE" mode
+  [[ -f "$f" ]] || return 0
+  [[ -n "$(config_get "$f" api_key)" ]] || return 0
+  mode=$(stat -c '%a' "$f" 2>/dev/null ||
+         stat -f '%Lp' "$f" 2>/dev/null) || return 0
+  case "$mode" in
+    [0-7][0-7][0-7]) ;;
+    *) return 0 ;;
+  esac
+  if (( (8#$mode & 8#077) != 0 )); then
+    printf 'agent.sh: warning: %s contains an api_key but is readable by' \
+      "$f" >&2
+    printf ' others; run chmod 600 on it\n' >&2
+  fi
+}
+
+# User prompts first, then the ones shipped beside the script. PROMPT_DIR is
+# an explicit override and is checked before both.
+build_prompt_dirs() {
+  PROMPT_DIRS=()
+  if [[ -n "$PROMPT_DIR" ]]; then PROMPT_DIRS+=("$PROMPT_DIR"); fi
+  PROMPT_DIRS+=("$CONFIG_DIR/prompts")
+  PROMPT_DIRS+=("$INSTALL_DIR/pro.mpts")
+}
+
+# The text of the first non-blank <prompt dir>/$1, else $2. {{cwd}} in it
+# stands for the working directory (the file cannot expand it).
 read_prompt() {
-  local f="$PROMPT_DIR/$1" t="" ph='{{cwd}}' i=0
-  [[ -f "$f" ]] && t=$(cat "$f" 2>/dev/null)
-  t=${t#"${t%%[![:space:]]*}"}            # trim, so a blank file falls back too
-  t=${t%"${t##*[![:space:]]}"}
+  local name="$1" fallback="$2" dir f t="" ph='{{cwd}}' i=0
+  PROMPT_FROM="built-in"
+  for dir in "${PROMPT_DIRS[@]}"; do
+    f="$dir/$name"
+    [[ -f "$f" ]] || continue
+    t=$(cat "$f" 2>/dev/null) || t=""
+    t=${t#"${t%%[![:space:]]*}"}          # trim, a blank file falls back too
+    t=${t%"${t##*[![:space:]]}"}
+    if [[ -n "$t" ]]; then PROMPT_FROM="$f"; break; fi
+  done
   while [[ "$t" == *"$ph"* ]] && (( i++ < 100 )); do
     t="${t%%"$ph"*}${PWD}${t#*"$ph"}"
   done
-  printf '%s' "${t:-$2}"
+  printf '%s' "${t:-$fallback}"
 }
 
 # Which prompts are in use, for /about
 prompt_notes() {
   local f n=""
   for f in SYSTEM.md COMPACTION.md PLAN.md; do
-    [[ -n "$(read_prompt "$f" '')" ]] && n+="${n:+, }$f"
+    read_prompt "$f" '' >/dev/null
+    if [[ "$PROMPT_FROM" != built-in ]]; then
+      n+="${n:+; }$f from $PROMPT_FROM"
+    fi
   done
-  if [[ -n "$n" ]]; then printf '%s from %s' "$n" "$PROMPT_DIR"
-  else printf 'built-in'; fi
+  if [[ -n "$n" ]]; then printf '%s' "$n"; else printf 'built-in'; fi
 }
 
 # Prints the 20 most recent saved sessions ($1 = "all" for every directory)
@@ -175,19 +365,23 @@ set_model() {
 
 # Version and environment details (REPL: /about, CLI: -V or --version)
 about() {
-  local jq_ver curl_ver run
+  local jq_ver curl_ver run cfg_note=""
   jq_ver=$(jq --version 2>/dev/null); jq_ver=${jq_ver/jq-/jq }
   curl_ver=$(curl --version 2>/dev/null | head -1 | cut -d' ' -f1,2)
   if [[ "$AUTO" == 1 ]]; then run="run without asking"; else run="ask first"; fi
+  if (( CONFIG_LOADED )); then cfg_note=" (loaded)"; fi
   printf 'agent.sh %s — a coding agent in bash\n' "$VERSION"
   printf '  %-9s %s\n' author "$AUTHOR"
   printf '  %-9s %s\n' released "$RELEASED"
   printf '  %-9s MIT (see LICENSE)\n' license
+  printf '  %-9s %s\n' config "$CONFIG_FILE$cfg_note"
+  printf '  %-9s %s\n' provider "$PROVIDER"
   printf '  %-9s %s\n' model "$MODEL"
   printf '  %-9s reasoning %s, thinking %s, temperature %s\n' params \
     "${REASONING:-default}" "${THINKING:-default}" \
     "${TEMPERATURE:-default}"
   printf '  %-9s %s\n' endpoint "$URL"
+  printf '  %-9s set (%s)\n' api-key "${API_KEY_SOURCE:-unknown}"
   printf '  %-9s %s\n' sessions "$SESSION_DIR"
   printf '  %-9s %s\n' auto "$run"
   if [[ "$MODE" == plan ]]; then
@@ -240,11 +434,14 @@ case "$MODE" in
   *) echo "agent.sh: MODE must be 'build' or 'plan'" >&2; exit 2 ;;
 esac
 
-: "${OPENCODE_API_KEY:?Please export OPENCODE_API_KEY}"
 for dep in jq curl; do
   command -v "$dep" >/dev/null ||
     { echo "agent.sh: '$dep' is required" >&2; exit 1; }
 done
+INSTALL_DIR=$(resolve_install_dir)
+build_prompt_dirs
+load_settings
+warn_config_permissions
 
 SYSTEM_DEFAULT="You are a coding agent working in the user's current directory
 ($PWD). Use the bash tool to inspect, create, edit and run files. Each command
@@ -494,7 +691,7 @@ assemble() { jq -Rn --argjson partial "${1:-false}" "$ASSEMBLE" <"$TMP/sse"; }
 http_post() {
   curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
     -D "$TMP/hdr" "$URL" \
-    -H "Authorization: Bearer $OPENCODE_API_KEY" \
+    -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
     -H "Accept: text/event-stream" \
     -H "x-opencode-session: $SESSION_ID" \

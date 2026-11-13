@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Nix flake: `packages.<system>.default` / `apps.default`, an overlay, a dev
+  shell, a formatter, and `nixosModules.default`. The module installs the
+  package (`programs.agent-sh.enable`) and can write
+  `/etc/agent.sh/config.json` from `programs.agent-sh.settings`.
+- JSON configuration: `provider`, `model`, `url`, `api_key`, `reasoning`,
+  `thinking` and `temperature` are read from `/etc/agent.sh/config.json`,
+  then `$XDG_CONFIG_HOME/agent.sh/config.json`, then the environment.
+  `provider = "opencode"` (or `opencode-go`) selects the default endpoint.
+- `AGENT_API_KEY` is now the primary API key variable; `OPENCODE_API_KEY`
+  keeps working. A config file holding an `api_key` that is readable by
+  others produces a warning.
+- `/about` shows the config path, provider, API-key source and the file each
+  prompt came from.
+
+### Changed
+
+- Prompt overrides are now looked up per file in `$PROMPT_DIR` (if set), then
+  `$XDG_CONFIG_HOME/agent.sh/prompts`, then `<install dir>/pro.mpts`, and
+  finally the built-in prompt. The first non-blank file wins.
+- `PROMPT_DIR` no longer defaults to `./pro.mpts`; the script looks next to
+  itself, so prompts are found when it is run from another directory or from
+  a Nix profile. Set `PROMPT_DIR` to keep pointing at a specific tree.
+
 ## [0.2.0] - 2026-11-13
 
 ### Added
