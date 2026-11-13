@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
-# Usage: agent.sh [-y] [-c | -r SESSION_ID] [prompt...]
+# Usage: agent.sh [-y] [-c | -r SESSION_ID] [-h] [prompt...]
 #        agent.sh -l [all]
 #   -y       run commands without asking (same as AUTO=1)
 #   -c       continue the most recent session in this directory
 #   -r ID    resume a specific session (full id or a unique prefix)
 #   -l       list saved sessions for this directory ("all": every directory)
-#   prompt   optional first message
+#   -h       show this help (--help works too)
+#   prompt   optional first message (put -- before one that starts with '-')
 #
 # REPL commands: /help  /sessions [all]  /resume ID  /reset  /auto  /exit (or Ctrl-D)
 # Ctrl-C stops the current reply or command without ending the session.
@@ -21,6 +22,7 @@ MAX_OUT="${MAX_OUT:-20000}"                         # tool output bytes sent to 
 TIMEOUT="${TIMEOUT:-300}"                           # give up after this many silent seconds
 SHOW_REASONING="${SHOW_REASONING:-1}"               # 1 = stream reasoning (dimmed)
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
+AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"      # lines kept in that file
 SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent.sh/sessions}"
 
 new_id() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "bash-agent-$$-$(date +%s)"; }
@@ -49,15 +51,21 @@ list_sessions() {
   return 0
 }
 
+usage() { sed -n '4,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
+
 RESUME=""
 LIST=0
+for arg in "$@"; do                    # getopts cannot see long options
+  case "$arg" in -h|--help) usage; exit 0 ;; --) break ;; esac
+done
 while getopts ":ycr:lh" opt; do
   case "$opt" in
     y) AUTO=1 ;;
     c) RESUME=last ;;
-    r) RESUME="$OPTARG" ;;
+    r) [[ -n "$OPTARG" ]] || { echo "agent.sh: -r needs a session id" >&2; exit 2; }
+       RESUME="$OPTARG" ;;
     l) LIST=1 ;;
-    h) sed -n '4,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0 ;;
+    h) usage; exit 0 ;;
     :) echo "agent.sh: -$OPTARG needs an argument" >&2; exit 2 ;;
     *) echo "agent.sh: unknown option -$OPTARG (try -h)" >&2; exit 2 ;;
   esac
@@ -103,7 +111,7 @@ session_file() { printf '%s/%s.json' "$SESSION_DIR" "$SESSION_ID"; }
 save_session() {
   local f; f=$(session_file)
   if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" '{id: $id, cwd: $cwd, messages: .}' \
-         <<<"$MESSAGES" >"$f.tmp" 2>/dev/null || ! mv -f "$f.tmp" "$f"; then
+         <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null || ! mv -f "$f.$$.tmp" "$f"; then
     echo "warning: could not save session to $f" >&2
   fi
 }
@@ -134,14 +142,20 @@ REPAIR='
 
 # Resolves a session id or unique id prefix to a saved session id
 resolve_session() {
-  local m=()
+  local f n=0 hit=""
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid session id '$1'." >&2; return 1; }
   if [[ -f "$SESSION_DIR/$1.json" ]]; then printf '%s\n' "$1"; return 0; fi
-  shopt -s nullglob; m=("$SESSION_DIR/$1"*.json); shopt -u nullglob
-  case ${#m[@]} in
+  # No nullglob and no ${#array[@]}: an unmatched pattern stays literal and is
+  # skipped by the -e test, and the counter also works on bash < 4.4 (where an
+  # empty array trips "set -u")
+  for f in "$SESSION_DIR/$1"*.json; do
+    [[ -e "$f" ]] || continue
+    n=$((n + 1)); hit="$f"
+  done
+  case $n in
     0) echo "No saved session matches '$1'." >&2; return 1 ;;
-    1) basename "${m[0]}" .json ;;
-    *) echo "'$1' matches ${#m[@]} sessions; type more of the id." >&2; return 1 ;;
+    1) basename "$hit" .json ;;
+    *) echo "'$1' matches $n sessions; type more of the id." >&2; return 1 ;;
   esac
 }
 
@@ -149,8 +163,18 @@ resolve_session() {
 load_session() {
   local id msgs
   id=$(resolve_session "$1") || return 1
-  msgs=$(jq -c ".messages | $REPAIR" "$SESSION_DIR/$id.json" 2>/dev/null) ||
-    { echo "Could not read session $id." >&2; return 1; }
+  # A session file that is not the shape we wrote (no "messages" array) must not
+  # leave MESSAGES as "null"; refuse it instead. A missing system prompt is put
+  # back so the model still knows where it is.
+  msgs=$(jq -c --arg s "$SYSTEM" '
+      (.messages | if type == "array" then . else empty end) | '"$REPAIR"'
+      | if (.[0].role // "") == "system" then .
+        else [{role: "system", content: $s}] + . end' \
+    "$SESSION_DIR/$id.json" 2>/dev/null) || msgs=""
+  if [[ -z "$msgs" ]]; then
+    echo "Could not read session $id: no usable \"messages\" array." >&2
+    return 1
+  fi
   MESSAGES="$msgs"
   SESSION_ID="$id"
   echo "Resumed session $SESSION_ID ($(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES") user messages)" >&2
@@ -174,7 +198,17 @@ fi
 # Append one JSON message and save. Everything goes through stdin, never argv:
 # a single argv string is capped at 128 KiB on Linux.
 append() {
-  MESSAGES=$(printf '%s\n%s' "$MESSAGES" "$1" | jq -cs '.[0] + [.[1]]')
+  local msg="$1" out=""
+  # A message we cannot add must not kill the session: warn and keep the history
+  # that is already saved, so the next turn still has a valid conversation.
+  if [[ -n "$msg" ]]; then
+    out=$(printf '%s\n%s' "$MESSAGES" "$msg" | jq -cs '.[0] + [.[1]]' 2>/dev/null) || out=""
+  fi
+  if [[ -z "$out" ]]; then
+    echo "warning: could not add a message to the session history" >&2
+    return 0
+  fi
+  MESSAGES="$out"
   save_session
 }
 last_role() { jq -r '.[-1].role' <<<"$MESSAGES"; }
@@ -212,7 +246,8 @@ ASSEMBLE='
       ($lines | join("\n") | fromjson? // .) as $body
       | if ($body | type) == "object" and ((try $body.choices[0].message catch null) != null)
         then {message: $body.choices[0].message, streamed: false}
-        else {error: $body} end
+        else {error: (if ($body | type) == "object" then ($body.error // $body)
+                      else $body end)} end
     elif any($ev[]; .error? != null) then
       {error: first($ev[] | select(.error? != null) | .error)}
     else
@@ -247,7 +282,7 @@ call_api() {
   for attempt in 1 2 3 4; do
     : >"$TMP/sse"; : >"$TMP/hdr"
     jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-       '{model: $model, tools: $tools, messages: ., stream: true}' <<<"$MESSAGES" |
+       '{model: $model, reasoning_effort: "low", tools: $tools, messages: ., stream: true}' <<<"$MESSAGES" |
     curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
       -D "$TMP/hdr" "$URL" \
       -H "Authorization: Bearer $OPENCODE_API_KEY" \
@@ -273,6 +308,11 @@ run_tool() {
   local cmd="$1" ok="" rc=0 out size half note=""
   printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
   if [[ "$AUTO" != 1 ]]; then
+    if ! { true </dev/tty; } 2>/dev/null; then   # nothing to ask the user on
+      TOOL_OUT="The user declined to run this command (no terminal to ask on; run with -y to approve commands up front)."
+      printf '%s\n' "$TOOL_OUT" >&2
+      return
+    fi
     read -rp "Run it? [y/N] " ok </dev/tty || ok=""
     if [[ ! "$ok" =~ ^[Yy] ]]; then
       TOOL_OUT="The user declined to run this command."
@@ -284,7 +324,12 @@ run_tool() {
   printf '%s\n' "$cmd" >"$TMP/cmd.sh"
   # Stream output live to the terminal while saving it to a file, so partial
   # output survives Ctrl-C and huge output never has to fit in a variable
-  bash "$TMP/cmd.sh" </dev/null 2>&1 | tee "$TMP/out" >&2 || rc=$?
+  # ${PIPESTATUS[0]} is the command's own status: under pipefail, $? is tee's
+  # when the output was not delivered (e.g. 'agent.sh ... | head'), which used
+  # to report a failed command that had in fact succeeded
+  if ! bash "$TMP/cmd.sh" </dev/null 2>&1 | tee "$TMP/out" >&2; then
+    rc=${PIPESTATUS[0]}
+  fi
 
   size=$(wc -c <"$TMP/out")
   if (( size > MAX_OUT )); then           # keep head and tail, say what was cut
@@ -336,7 +381,9 @@ run_turn() {
     result=$(assemble)
     if ! msg=$(jq -ce '.message // empty' <<<"$result"); then
       echo "API error:" >&2
-      jq -r '.error | if . == null or . == "" then "(no response)" else . end' <<<"$result" >&2
+      jq -r '(.error // "(no response)")
+             | if type == "object" then (.message // tojson) else . end
+             | if . == "" then "(no response)" else . end' <<<"$result" >&2
       abort_turn
       return
     fi
@@ -379,7 +426,12 @@ run_turn() {
 
 # ---------------------------------------------------------------- REPL
 
-# Readline history across runs
+# Readline history across runs, trimmed so the file cannot grow without bound
+if [[ -f "$AGENT_HISTFILE" ]] &&
+   (( $(wc -l <"$AGENT_HISTFILE" 2>/dev/null || echo 0) > AGENT_HISTORY_MAX )); then
+  tail -n "$AGENT_HISTORY_MAX" "$AGENT_HISTFILE" >"$AGENT_HISTFILE.$$.tmp" &&
+    mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE" || rm -f "$AGENT_HISTFILE.$$.tmp"
+fi
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
 
 input="$FIRST_PROMPT"
