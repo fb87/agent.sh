@@ -30,6 +30,8 @@
 # They are looked up in $PROMPT_DIR (if set), then in
 # $XDG_CONFIG_HOME/agent.sh/prompts, then in <install dir>/pro.mpts; a missing
 # or blank file keeps the built-in, and {{cwd}} is the working directory.
+# On the first run the config directory is created and the bundled prompts are
+# copied into it, ready to edit; a fresh session also prints /about.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
@@ -239,6 +241,22 @@ build_prompt_dirs() {
   PROMPT_DIRS+=("$INSTALL_DIR/pro.mpts")
 }
 
+# First run only: create the config directory and seed its prompts with the
+# ones shipped beside the script so they can be edited. Nothing is written if
+# the directory already exists.
+init_config_dir() {
+  local src="$INSTALL_DIR/pro.mpts" f
+  [[ -d "$CONFIG_DIR" ]] && return 0
+  mkdir -p "$CONFIG_DIR/prompts" 2>/dev/null || return 0
+  [[ -d "$src" ]] || return 0
+  for f in "$src"/*.md; do
+    [[ -f "$f" ]] || continue
+    cp "$f" "$CONFIG_DIR/prompts/" 2>/dev/null || true
+  done
+  printf 'agent.sh: created %s and copied the prompts there\n' \
+    "$CONFIG_DIR/prompts" >&2
+}
+
 # The text of the first non-blank <prompt dir>/$1, else $2. {{cwd}} in it
 # stands for the working directory (the file cannot expand it).
 read_prompt() {
@@ -440,6 +458,7 @@ for dep in jq curl; do
 done
 INSTALL_DIR=$(resolve_install_dir)
 build_prompt_dirs
+init_config_dir
 load_settings
 warn_config_permissions
 
@@ -589,6 +608,7 @@ if [[ -n "$RESUME" ]]; then
 else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
   new_history
+  about                                  # banner on a fresh start
 fi
 apply_mode "$MODE"
 

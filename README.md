@@ -114,6 +114,10 @@ file falls through to the next location. `{{cwd}}` in a prompt is replaced by
 the working directory. Package installs ship `pro.mpts` beside the real
 script; check `/about` to see which file each prompt came from.
 
+On the first run, `agent.sh` creates `$XDG_CONFIG_HOME/agent.sh/prompts/` and
+copies the bundled prompts into it, so they are ready to edit. The directory
+is only created once; existing files are never overwritten.
+
 ## Usage
 
 | Command | Purpose |
@@ -130,7 +134,7 @@ script; check `/about` to see which file each prompt came from.
 
 Sessions are JSON files under `~/.local/state/agent.sh/sessions`; `-c`
 continues the latest in the current directory, `-r ID` resumes one, `-l [all]`
-lists them.
+lists them. A fresh session (no `-c`/`-r`) starts with the `/about` card.
 
 ## Development
 

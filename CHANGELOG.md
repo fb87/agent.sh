@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   others produces a warning.
 - `/about` shows the config path, provider, API-key source and the file each
   prompt came from.
+- A fresh session (no `-c`/`-r`) prints the `/about` card as a banner.
+- The first run creates `$XDG_CONFIG_HOME/agent.sh/prompts/` and copies the
+  bundled prompts into it; an existing directory or file is left untouched.
 
 ### Changed
 
