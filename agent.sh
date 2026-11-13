@@ -15,6 +15,8 @@
 #                /exit (or Ctrl-D)
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off); /compact does it on demand.
+# The built-in prompts can be replaced by SYSTEM.md and COMPACTION.md in
+# ./pro.mpts/ (or $PROMPT_DIR); a missing or empty file keeps the built-in one.
 # Ctrl-C stops the current reply or command without ending the session.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
@@ -30,12 +32,32 @@ SHOW_REASONING="${SHOW_REASONING:-1}"               # 1 = stream reasoning (dimm
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
 AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"      # lines kept in that file
 SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent.sh/sessions}"
+PROMPT_DIR="${PROMPT_DIR:-./pro.mpts}"              # optional SYSTEM.md/COMPACTION.md
 
 VERSION="0.1.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
 new_id() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "bash-agent-$$-$(date +%s)"; }
+
+# The text of $PROMPT_DIR/$1 when that file exists and is not blank, else $2
+read_prompt() {
+  local f="$PROMPT_DIR/$1" t=""
+  [[ -f "$f" ]] && t=$(cat "$f" 2>/dev/null)
+  t=${t#"${t%%[![:space:]]*}"}            # trim, so a blank file falls back too
+  t=${t%"${t##*[![:space:]]}"}
+  printf '%s' "${t:-$2}"
+}
+
+# Which prompts are in use, for /about
+prompt_notes() {
+  local f n=""
+  for f in SYSTEM.md COMPACTION.md; do
+    [[ -n "$(read_prompt "$f" '')" ]] && n+="${n:+, }$f"
+  done
+  if [[ -n "$n" ]]; then printf '%s from %s' "$n" "$PROMPT_DIR"
+  else printf 'built-in'; fi
+}
 
 # Prints the 20 most recent saved sessions ($1 = "all" for every directory)
 list_sessions() {
@@ -82,6 +104,7 @@ about() {
   else
     printf '  %-9s only with /compact\n' compact
   fi
+  printf '  %-9s %s\n' prompts "$(prompt_notes)"
   printf '  %-9s %s, %s, %s\n' runtime "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
   printf '  %-9s %s\n' script "$0"
 }
@@ -117,10 +140,11 @@ for dep in jq curl; do
   command -v "$dep" >/dev/null || { echo "agent.sh: '$dep' is required" >&2; exit 1; }
 done
 
-SYSTEM="You are a coding agent working in the user's current directory ($PWD).
+SYSTEM_DEFAULT="You are a coding agent working in the user's current directory ($PWD).
 Use the bash tool to inspect, create, edit and run files. Each command runs in a
 fresh non-interactive bash process with no stdin, so 'cd' and variables do not
 persist between calls and interactive programs will not work. Be concise."
+SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
 
 # OpenAI-style tool definition
 TOOLS='[{
@@ -355,7 +379,8 @@ call_api() { request "$MESSAGES"; }
 # ---------------------------------------------------------------- compacting
 
 # What to keep when the conversation is folded into a summary
-COMPACT_ASK='Summarize the conversation above so that everything before it can be dropped from the context. Keep the task and its goal, the decisions and why, the files and paths involved, the commands run and what they showed, the current state, and what is left to do. Output the summary only, no preamble.'
+COMPACT_DEFAULT='Summarize the conversation above so that everything before it can be dropped from the context. Keep the task and its goal, the decisions and why, the files and paths involved, the commands run and what they showed, the current state, and what is left to do. Output the summary only, no preamble.'
+COMPACT_ASK=$(read_prompt COMPACTION.md "$COMPACT_DEFAULT")
 
 # Folds the conversation into one summary message (system + summary). The old
 # transcript is left next to the session file as <id>.json.bak.
