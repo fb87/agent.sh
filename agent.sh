@@ -11,8 +11,8 @@
 #   -V       show the version (--version works too)
 #   prompt   optional first message (put -- before one that starts with '-')
 #
-# REPL commands: /help  /about  /compact  /sessions [all]  /resume ID  /reset  /auto
-#                /exit (or Ctrl-D)
+# REPL commands: /help  /about  /compact  /sessions [all]  /resume ID
+#                /reset  /auto  /exit (or Ctrl-D)
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off); /compact does it on demand.
 # The built-in prompts can be replaced by SYSTEM.md and COMPACTION.md in
@@ -24,22 +24,26 @@ set -euo pipefail
 
 MODEL="${MODEL:-deepseek-v4.1-flash}"
 URL="${URL:-https://opencode.ai/zen/go/v1/chat/completions}"
-AUTO="${AUTO:-0}"                                   # 1 = no confirmation prompt
-MAX_OUT="${MAX_OUT:-20000}"                         # tool output bytes sent to the model
-AUTO_COMPACT="${AUTO_COMPACT:-1}"                   # 1 = summarize a long history by itself
-COMPACT_AT="${COMPACT_AT:-100000}"                  # history bytes that trigger that
-TIMEOUT="${TIMEOUT:-300}"                           # give up after this many silent seconds
-SHOW_REASONING="${SHOW_REASONING:-1}"               # 1 = stream reasoning (dimmed)
+AUTO="${AUTO:-0}"                          # 1 = no confirmation prompt
+MAX_OUT="${MAX_OUT:-20000}"                # tool output bytes sent to the model
+AUTO_COMPACT="${AUTO_COMPACT:-1}"          # 1 = auto-summarize a long history
+COMPACT_AT="${COMPACT_AT:-100000}"         # history bytes that trigger that
+TIMEOUT="${TIMEOUT:-300}"                  # seconds of silence before giving up
+SHOW_REASONING="${SHOW_REASONING:-1}"      # 1 = stream reasoning (dimmed)
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
-AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"      # lines kept in that file
-SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agent.sh/sessions}"
-PROMPT_DIR="${PROMPT_DIR:-./pro.mpts}"              # optional SYSTEM.md/COMPACTION.md
+AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"   # lines kept in that file
+SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}\
+/agent.sh/sessions}"
+PROMPT_DIR="${PROMPT_DIR:-./pro.mpts}"     # optional prompt overrides
 
 VERSION="0.1.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
-new_id() { uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "bash-agent-$$-$(date +%s)"; }
+new_id() {
+  uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null ||
+    echo "bash-agent-$$-$(date +%s)"
+}
 
 # The text of $PROMPT_DIR/$1 when that file exists and is not blank, else $2.
 # {{cwd}} in it stands for the working directory (the file cannot expand it).
@@ -73,9 +77,12 @@ list_sessions() {
         select($all == "all" or .cwd == $pwd)
         | [.messages[] | select(.role == "user") | .content] as $u
         | [(if .id == $cur then "*" else " " end), .id, ($u | length),
-           ($u[0] // "" | gsub("\\s+"; " ") | .[:50] | if . == "" or . == " " then "-" else . end),
-           .cwd] | @tsv' "$f" 2>/dev/null) || continue   # no empty fields: read would shift them
-    when=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")
+           ($u[0] // "" | gsub("\\s+"; " ") | .[:50]
+            | if . == "" or . == " " then "-" else . end),
+           .cwd] | @tsv' "$f" 2>/dev/null) || continue
+    # (no empty fields: read would shift them)
+    when=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null ||
+           stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")
     printf '%s %s  %-36s %3s msgs  %s' "$cur" "$when" "$id" "$count" "$preview"
     if [[ "${1:-}" == all ]]; then printf '  \033[2m%s\033[0m' "$cwd"; fi
     printf '\n'
@@ -110,7 +117,8 @@ about() {
     printf '  %-9s only with /compact\n' compact
   fi
   printf '  %-9s %s\n' prompts "$(prompt_notes)"
-  printf '  %-9s %s, %s, %s\n' runtime "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
+  printf '  %-9s %s, %s, %s\n' runtime \
+    "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
   printf '  %-9s %s\n' script "$0"
 }
 
@@ -127,7 +135,8 @@ while getopts ":ycr:lhV" opt; do
   case "$opt" in
     y) AUTO=1 ;;
     c) RESUME=last ;;
-    r) [[ -n "$OPTARG" ]] || { echo "agent.sh: -r needs a session id" >&2; exit 2; }
+    r) [[ -n "$OPTARG" ]] ||
+         { echo "agent.sh: -r needs a session id" >&2; exit 2; }
        RESUME="$OPTARG" ;;
     l) LIST=1 ;;
     h) usage; exit 0 ;;
@@ -142,28 +151,28 @@ FIRST_PROMPT="$*"
 
 : "${OPENCODE_API_KEY:?Please export OPENCODE_API_KEY}"
 for dep in jq curl; do
-  command -v "$dep" >/dev/null || { echo "agent.sh: '$dep' is required" >&2; exit 1; }
+  command -v "$dep" >/dev/null ||
+    { echo "agent.sh: '$dep' is required" >&2; exit 1; }
 done
 
-SYSTEM_DEFAULT="You are a coding agent working in the user's current directory ($PWD).
-Use the bash tool to inspect, create, edit and run files. Each command runs in a
-fresh non-interactive bash process with no stdin, so 'cd' and variables do not
-persist between calls and interactive programs will not work. Be concise."
+SYSTEM_DEFAULT="You are a coding agent working in the user's current directory
+($PWD). Use the bash tool to inspect, create, edit and run files. Each command
+runs in a fresh non-interactive bash process with no stdin, so 'cd' and
+variables do not persist between calls and interactive programs will not work.
+Be concise."
 SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
 
 # OpenAI-style tool definition
-TOOLS='[{
-  "type": "function",
-  "function": {
-    "name": "bash",
-    "description": "Run a bash script in the current directory. Returns combined stdout/stderr and the exit code if non-zero.",
-    "parameters": {
-      "type": "object",
-      "properties": { "command": { "type": "string", "description": "The bash command or script to run" } },
-      "required": ["command"]
-    }
-  }
-}]'
+# Built with jq: a JSON string cannot be broken across lines
+TOOLS=$(jq -cn '
+  [{type: "function", function: {
+    name: "bash",
+    description: ("Run a bash script in the current directory. Returns " +
+                  "combined stdout/stderr and the exit code if non-zero."),
+    parameters: {type: "object",
+      properties: {command: {type: "string",
+        description: "The bash command or script to run"}},
+      required: ["command"]}}}]')
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -177,13 +186,17 @@ session_file() { printf '%s/%s.json' "$SESSION_DIR" "$SESSION_ID"; }
 
 save_session() {
   local f; f=$(session_file)
-  if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" '{id: $id, cwd: $cwd, messages: .}' \
-         <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null || ! mv -f "$f.$$.tmp" "$f"; then
+  if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" \
+         '{id: $id, cwd: $cwd, messages: .}' \
+         <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null ||
+     ! mv -f "$f.$$.tmp" "$f"; then
     echo "warning: could not save session to $f" >&2
   fi
 }
 
-new_history() { MESSAGES=$(jq -cn --arg s "$SYSTEM" '[{role: "system", content: $s}]'); }
+new_history() {
+  MESSAGES=$(jq -cn --arg s "$SYSTEM" '[{role: "system", content: $s}]')
+}
 
 # Most recently saved session whose cwd is this directory
 find_last_session() {
@@ -203,14 +216,17 @@ REPAIR='
   ([to_entries[] | select(.value.role == "assistant") | .key] | last) as $i
   | if $i == null or ((.[$i].tool_calls // []) | length) == 0 then .
     else [.[$i + 1:][] | select(.role == "tool") | .tool_call_id] as $done
-      | . + [.[$i].tool_calls[] | .id as $id | select(any($done[]; . == $id) | not)
-             | {role: "tool", tool_call_id: $id, content: "Not run: the session ended first."}]
+      | . + [.[$i].tool_calls[] | .id as $id
+             | select(any($done[]; . == $id) | not)
+             | {role: "tool", tool_call_id: $id,
+                content: "Not run: the session ended first."}]
     end'
 
 # Resolves a session id or unique id prefix to a saved session id
 resolve_session() {
   local f n=0 hit=""
-  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid session id '$1'." >&2; return 1; }
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    { echo "Invalid session id '$1'." >&2; return 1; }
   if [[ -f "$SESSION_DIR/$1.json" ]]; then printf '%s\n' "$1"; return 0; fi
   # No nullglob and no ${#array[@]}: an unmatched pattern stays literal and is
   # skipped by the -e test, and the counter also works on bash < 4.4 (where an
@@ -228,7 +244,7 @@ resolve_session() {
 
 # Switches to a saved session; the current one is already saved
 load_session() {
-  local id msgs
+  local id msgs n
   id=$(resolve_session "$1") || return 1
   # A session file that is not the shape we wrote (no "messages" array) must not
   # leave MESSAGES as "null"; refuse it instead. A missing system prompt is put
@@ -244,9 +260,11 @@ load_session() {
   fi
   MESSAGES="$msgs"
   SESSION_ID="$id"
-  echo "Resumed session $SESSION_ID ($(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES") user messages)" >&2
+  n=$(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES")
+  echo "Resumed session $SESSION_ID ($n user messages)" >&2
   # Remind the user where the conversation left off
-  jq -r '[.[] | select(.role == "assistant" and (.content // "") != "") | .content] | last // empty
+  jq -r '[.[] | select(.role == "assistant" and (.content // "") != "")
+          | .content] | last // empty
          | if length > 300 then .[:300] + "..." else . end' <<<"$MESSAGES" |
     sed $'s/^/\033[2m  /; s/$/\033[0m/' >&2
 }
@@ -254,7 +272,8 @@ load_session() {
 mkdir -p "$SESSION_DIR"
 if [[ -n "$RESUME" ]]; then
   if [[ "$RESUME" == last ]]; then
-    RESUME=$(find_last_session) || { echo "agent.sh: no saved session for $PWD" >&2; exit 1; }
+    RESUME=$(find_last_session) ||
+      { echo "agent.sh: no saved session for $PWD" >&2; exit 1; }
   fi
   load_session "$RESUME" || exit 1
 else
@@ -269,7 +288,8 @@ append() {
   # A message we cannot add must not kill the session: warn and keep the history
   # that is already saved, so the next turn still has a valid conversation.
   if [[ -n "$msg" ]]; then
-    out=$(printf '%s\n%s' "$MESSAGES" "$msg" | jq -cs '.[0] + [.[1]]' 2>/dev/null) || out=""
+    out=$(printf '%s\n%s' "$MESSAGES" "$msg" |
+          jq -cs '.[0] + [.[1]]' 2>/dev/null) || out=""
   fi
   if [[ -z "$out" ]]; then
     echo "warning: could not add a message to the session history" >&2
@@ -285,18 +305,23 @@ last_role() { jq -r '.[-1].role' <<<"$MESSAGES"; }
 # Prints content deltas as they arrive (reasoning dimmed), from SSE on stdin
 show_stream() {
   jq -Rnrj --unbuffered --argjson show "$SHOW_REASONING" '
-    foreach ((inputs | sub("\r$"; "") | select(startswith("data:")) | sub("^data: ?"; "")
-              | select(. != "[DONE]") | fromjson? | .choices[0]?.delta? // empty), null) as $d
+    foreach ((inputs | sub("\r$"; "")
+              | select(startswith("data:")) | sub("^data: ?"; "")
+              | select(. != "[DONE]") | fromjson?
+              | .choices[0]?.delta? // empty), null) as $d
       ({mode: "", out: ""};
-       if $d == null then          # end of stream: reset color, finish the line
-         .out = (if .mode == "r" then "\u001b[0m\n" elif .mode == "c" then "\n" else "" end)
+       if $d == null then      # end of stream: reset color, finish the line
+         .out = (if .mode == "r" then "\u001b[0m\n"
+                 elif .mode == "c" then "\n" else "" end)
        else
          .out = ""
          | if $show == 1 and (($d.reasoning_content? // "") != "") then
-             .out = (if .mode != "r" then "\u001b[2m" else "" end) + $d.reasoning_content | .mode = "r"
+             .out = (if .mode != "r" then "\u001b[2m" else "" end)
+                    + $d.reasoning_content | .mode = "r"
            else . end
          | if (($d.content? // "") != "") then
-             .out += (if .mode == "r" then "\u001b[0m\n" else "" end) + $d.content | .mode = "c"
+             .out += (if .mode == "r" then "\u001b[0m\n" else "" end)
+                     + $d.content | .mode = "c"
            else . end
        end;
        .out)'
@@ -307,32 +332,41 @@ show_stream() {
 # With $partial, an unfinished stream still yields what arrived so far.
 ASSEMBLE='
   [inputs | sub("\r$"; "")] as $lines
-  | [$lines[] | select(startswith("data:")) | sub("^data: ?"; "") | select(. != "[DONE]") | fromjson?] as $ev
+  | [$lines[] | select(startswith("data:")) | sub("^data: ?"; "")
+     | select(. != "[DONE]") | fromjson?] as $ev
   | if ($ev | length) == 0 then
       # Not SSE: an error body, or a server that ignored "stream": true
       ($lines | join("\n") | fromjson? // .) as $body
-      | if ($body | type) == "object" and ((try $body.choices[0].message catch null) != null)
+      | if ($body | type) == "object"
+           and ((try $body.choices[0].message catch null) != null)
         then {message: $body.choices[0].message, streamed: false}
-        else {error: (if ($body | type) == "object" then ($body.error // $body)
-                      else $body end)} end
+        else {error: (if ($body | type) == "object"
+                      then ($body.error // $body) else $body end)} end
     elif any($ev[]; .error? != null) then
       {error: first($ev[] | select(.error? != null) | .error)}
     else
-      (reduce ($ev[] | .choices[0]?.delta? // empty) as $d ({role: "assistant", content: ""};
+      (reduce ($ev[] | .choices[0]?.delta? // empty) as $d
+          ({role: "assistant", content: ""};
           .content += ($d.content // "")
           | if ($d.reasoning_content // "") != "" then
-              .reasoning_content = (.reasoning_content // "") + $d.reasoning_content
+              .reasoning_content = (.reasoning_content // "")
+                                    + $d.reasoning_content
             else . end
-          # tool calls arrive in pieces, keyed by index; arguments are concatenated
+          # tool calls arrive in pieces, keyed by index; arguments are
+          # concatenated
           | reduce ($d.tool_calls // [])[] as $t (.;
               ($t.index // 0) as $i
               | .tool_calls[$i].id //= $t.id
               | .tool_calls[$i].type = "function"
               | .tool_calls[$i].function.name //= $t.function.name
-              | .tool_calls[$i].function.arguments = (.tool_calls[$i].function.arguments // "")
-                  + ($t.function.arguments // "" | if type == "string" then . else tojson end)))
-        | if .tool_calls then .tool_calls |= map(select(. != null)) else . end
-        | if .content == "" and .tool_calls then .content = null else . end) as $m
+              | .tool_calls[$i].function.arguments =
+                  (.tool_calls[$i].function.arguments // "")
+                  + ($t.function.arguments // ""
+                     | if type == "string" then . else tojson end)))
+        | if .tool_calls then .tool_calls |= map(select(. != null))
+          else . end
+        | if .content == "" and .tool_calls then .content = null
+          else . end) as $m
       | if $partial or any($lines[]; test("^data: ?\\[DONE\\]$"))
            or any($ev[]; .choices[0]?.finish_reason? != null)
         then {message: $m, streamed: true}
@@ -359,7 +393,8 @@ http_post() {
 # after part of a reply was already shown.
 request() {
   local msgs="$1" quiet="${2:-}" attempt code body
-  body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" --arg mode "$quiet" \
+  body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
+    --arg mode "$quiet" \
     '{model: $model, reasoning_effort: "low", messages: ., stream: true}
      + (if $mode == "quiet" then {} else {tools: $tools} end)' <<<"$msgs")
   for attempt in 1 2 3 4; do
@@ -373,7 +408,8 @@ request() {
     code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
     [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]] && return 0
     (( attempt < 4 )) || return 0
-    printf '(request failed%s; retrying in %ss...)\n' "${code:+, HTTP $code}" $((attempt * 2)) >&2
+    printf '(request failed%s; retrying in %ss...)\n' \
+      "${code:+, HTTP $code}" $((attempt * 2)) >&2
     sleep $((attempt * 2)) || true
     (( INTERRUPTED )) && return 0
   done
@@ -384,7 +420,12 @@ call_api() { request "$MESSAGES"; }
 # ---------------------------------------------------------------- compacting
 
 # What to keep when the conversation is folded into a summary
-COMPACT_DEFAULT='Summarize the conversation above so that everything before it can be dropped from the context. Keep the task and its goal, the decisions and why, the files and paths involved, the commands run and what they showed, the current state, and what is left to do. Output the summary only, no preamble.'
+COMPACT_DEFAULT='Summarize the conversation above so that everything '
+COMPACT_DEFAULT+='before it can be dropped from the context. Keep the '
+COMPACT_DEFAULT+='task and its goal, the decisions and why, the files and '
+COMPACT_DEFAULT+='paths involved, the commands run and what they showed, '
+COMPACT_DEFAULT+='the current state, and what is left to do. Output the '
+COMPACT_DEFAULT+='summary only, no preamble.'
 COMPACT_ASK=$(read_prompt COMPACTION.md "$COMPACT_DEFAULT")
 
 # Folds the conversation into one summary message (system + summary). The old
@@ -407,8 +448,10 @@ compact() {
   result=$(assemble)
   if ! summary=$(jq -er '(.message.content // "") | gsub("^\\s+|\\s+$"; "")
                          | select(. != "")' <<<"$result"); then
-    printf 'Could not compact: %s\n' "$(jq -r '(.error // "empty reply")
-      | if type == "object" then (.message // tojson) else tostring end' <<<"$result")" >&2
+    printf 'Could not compact: %s\n' \
+      "$(jq -r '(.error // "empty reply")
+         | if type == "object" then (.message // tojson)
+           else tostring end' <<<"$result")" >&2
     return 1
   fi
   before=$(printf '%s' "$MESSAGES" | wc -c)
@@ -417,7 +460,8 @@ compact() {
   MESSAGES=$(jq -cn --arg s "$SYSTEM" --arg sum "$summary" '
       [{role: "system", content: $s},
        {role: "user",
-        content: "Summary of the conversation so far (everything before it was compacted to save context):\n\n" + $sum}]')
+        content: ("Summary of the conversation so far (everything before it "
+                  + "was compacted to save context):\n\n") + $sum}]')
   save_session
   after=$(printf '%s' "$MESSAGES" | wc -c)
   printf '(compacted %s messages, %s bytes -> one summary, %s bytes)\n' \
@@ -431,7 +475,8 @@ auto_compact() {
   (( AUTO_COMPACT )) || return 0
   size=$(printf '%s' "$MESSAGES" | wc -c)
   (( size > COMPACT_AT )) || return 0
-  n=$(jq '[.[] | select(.role != "system")] | length' <<<"$MESSAGES" 2>/dev/null) || n=0
+  n=$(jq '[.[] | select(.role != "system")] | length' <<<"$MESSAGES" \
+        2>/dev/null) || n=0
   (( n > 0 )) || return 0             # only the system prompt: nothing to fold
   printf '(history is %s bytes; compacting it first)\n' "$size" >&2
   compact || printf '(compaction failed; carrying on)\n' >&2
@@ -440,13 +485,15 @@ auto_compact() {
 
 # ---------------------------------------------------------------- tools
 
-# Runs one command; result goes in TOOL_OUT (no subshell, so Ctrl-C state survives)
+# Runs one command; result goes in TOOL_OUT (no subshell, so Ctrl-C state
+# survives)
 run_tool() {
   local cmd="$1" ok="" rc=0 out size half note=""
   printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
   if [[ "$AUTO" != 1 ]]; then
     if ! { true </dev/tty; } 2>/dev/null; then   # nothing to ask the user on
-      TOOL_OUT="The user declined to run this command (no terminal to ask on; run with -y to approve commands up front)."
+      TOOL_OUT="The user declined to run this command (no terminal to ask"
+      TOOL_OUT+=" on; run with -y to approve commands up front)."
       printf '%s\n' "$TOOL_OUT" >&2
       return
     fi
@@ -471,7 +518,9 @@ run_tool() {
   size=$(wc -c <"$TMP/out")
   if (( size > MAX_OUT )); then           # keep head and tail, say what was cut
     half=$(( MAX_OUT / 2 ))
-    out="$(head -c "$half" "$TMP/out" | tr -d '\0')"$'\n'"...[$(( size - MAX_OUT )) bytes truncated]..."$'\n'"$(tail -c "$half" "$TMP/out" | tr -d '\0')"
+    out=$(head -c "$half" "$TMP/out" | tr -d '\0')
+    out+=$'\n'"...[$(( size - MAX_OUT )) bytes truncated]..."$'\n'
+    out+=$(tail -c "$half" "$TMP/out" | tr -d '\0')
   else
     out=$(tr -d '\0' <"$TMP/out")
   fi
@@ -495,7 +544,8 @@ abort_turn() {
   case "$(last_role)" in
     user) MESSAGES=$(jq -c '.[:-1]' <<<"$MESSAGES"); save_session
           echo "(message not sent — press Up to retry)" >&2 ;;
-    tool) append '{"role": "assistant", "content": "(request failed; turn aborted)"}' ;;
+    tool) append '{"role": "assistant",
+                  "content": "(request failed; turn aborted)"}' ;;
   esac
 }
 
@@ -509,8 +559,11 @@ run_turn() {
     if (( INTERRUPTED )); then
       printf '\033[0m\n(interrupted)\n' >&2
       # Keep whatever text was already shown; drop half-written tool calls
-      msg=$(assemble true | jq -c '.message // empty | select((.content // "") != "")
-              | {role, content: (.content + "\n[interrupted by the user]")}')
+      msg=$(assemble true |
+            jq -c '.message // empty
+                   | select((.content // "") != "")
+                   | {role,
+                      content: (.content + "\n[interrupted by the user]")}')
       if [[ -n "$msg" ]]; then append "$msg"; else abort_turn; fi
       return
     fi
@@ -525,10 +578,12 @@ run_turn() {
       return
     fi
 
-    # Save the whole assistant message (keeps tool_calls and any reasoning_content)
+    # Save the whole assistant message (keeps tool_calls and any
+    # reasoning_content)
     append "$msg"
     # Streamed text is already on screen; a non-streamed reply is not
-    [[ "$(jq -r '.streamed' <<<"$result")" == true ]] || jq -r '.content // empty' <<<"$msg"
+    [[ "$(jq -r '.streamed' <<<"$result")" == true ]] ||
+      jq -r '.content // empty' <<<"$msg"
 
     # No tool calls -> the model is done with this turn
     [[ "$(jq '.tool_calls // [] | length' <<<"$msg")" -gt 0 ]] || return 0
@@ -537,21 +592,26 @@ run_turn() {
       id=$(jq -r '.id' <<<"$call")
       name=$(jq -r '.function.name' <<<"$call")
       # arguments is normally a JSON *string*, but some backends send an object
-      cmd=$(jq -r '(.function.arguments | if type == "string" then fromjson? else . end | .command?) // empty' <<<"$call")
+      cmd=$(jq -r '(.function.arguments
+                    | if type == "string" then fromjson? else . end
+                    | .command?) // empty' <<<"$call")
       if (( INTERRUPTED )); then
         out="Skipped: the user interrupted."
       elif [[ "$name" != "bash" ]]; then
         out="Error: unknown tool '$name'. The only tool is 'bash'."
         printf '%s\n' "$out" >&2
       elif [[ -z "$cmd" ]]; then
-        out='Error: invalid tool arguments; expected JSON like {"command": "..."}.'
+        out='Error: invalid tool arguments; expected JSON like'
+        out+=' {"command": "..."}.'
         printf '%s\n' "$out" >&2
       else
         run_tool "$cmd"
         out="$TOOL_OUT"
       fi
       # Each result is its own message with role "tool"
-      append "$(printf '%s' "$out" | jq -cRs --arg id "$id" '{role: "tool", tool_call_id: $id, content: .}')"
+      append "$(printf '%s' "$out" |
+        jq -cRs --arg id "$id" \
+           '{role: "tool", tool_call_id: $id, content: .}')"
     done < <(jq -c '.tool_calls[]' <<<"$msg")
 
     if (( INTERRUPTED )); then
@@ -565,9 +625,11 @@ run_turn() {
 
 # Readline history across runs, trimmed so the file cannot grow without bound
 if [[ -f "$AGENT_HISTFILE" ]] &&
-   (( $(wc -l <"$AGENT_HISTFILE" 2>/dev/null || echo 0) > AGENT_HISTORY_MAX )); then
+   (( $(wc -l <"$AGENT_HISTFILE" 2>/dev/null || echo 0) \
+        > AGENT_HISTORY_MAX )); then
   tail -n "$AGENT_HISTORY_MAX" "$AGENT_HISTFILE" >"$AGENT_HISTFILE.$$.tmp" &&
-    mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE" || rm -f "$AGENT_HISTFILE.$$.tmp"
+    mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE" ||
+    rm -f "$AGENT_HISTFILE.$$.tmp"
 fi
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
 
@@ -576,11 +638,13 @@ while true; do
   if [[ -z "$input" ]]; then
     rc=0
     # Read in a subshell with default SIGINT: Ctrl-C kills only the subshell and
-    # we draw a fresh prompt (readline under a trap keeps the old, cleared line).
+    # we draw a fresh prompt (readline under a trap keeps the old, cleared
+    # line).
     # The fork inherits the history list, so Up arrow still works.
     # \001 \002 mark the color codes as zero-width for readline
+    prompt_text=$'\n\001\033[36m\002'"$SESSION_ID"$'$\001\033[0m\002 '
     input=$(trap - INT
-            IFS= read -erp $'\n\001\033[36m\002'"$SESSION_ID"$'$\001\033[0m\002 ' line &&
+            IFS= read -erp "$prompt_text" line &&
             printf '%s' "$line") || rc=$?
     if (( rc > 128 )); then input=""; continue; fi         # Ctrl-C: new prompt
     (( rc == 0 )) || { echo; break; }                       # Ctrl-D: quit
@@ -602,16 +666,26 @@ while true; do
             fi ;;
     /about) about ;;
     /compact) compact || true ;;
-    /reset) SESSION_ID=$(new_id); new_history; echo "New session $SESSION_ID." ;;
-    /auto)  if [[ "$AUTO" == 1 ]]; then AUTO=0; echo "Commands need confirmation."
-            else AUTO=1; echo "Commands run WITHOUT confirmation."; fi ;;
+    /reset) SESSION_ID=$(new_id); new_history
+            echo "New session $SESSION_ID." ;;
+    /auto)  if [[ "$AUTO" == 1 ]]; then
+              AUTO=0; echo "Commands need confirmation."
+            else
+              AUTO=1; echo "Commands run WITHOUT confirmation."
+            fi ;;
     /help)  echo "/about           version, author, model and session details"
-            echo "/compact         summarize the conversation to free up context"
-            echo "                 (automatic above $COMPACT_AT bytes; AUTO_COMPACT=0 disables)"
-            echo "/sessions [all]  list saved sessions (this directory, or all)"
-            echo "/resume ID       switch to a saved session (id or unique prefix)"
-            echo "/reset           start a new session (the old one stays resumable)"
-            echo "/auto            toggle running commands without confirmation (now: $AUTO)"
+            echo "/compact         summarize the conversation to free up"\
+                 "context"
+            echo "                 (automatic above $COMPACT_AT bytes;"\
+                 "AUTO_COMPACT=0 disables)"
+            echo "/sessions [all]  list saved sessions (this directory, or"\
+                 "all)"
+            echo "/resume ID       switch to a saved session (id or unique"\
+                 "prefix)"
+            echo "/reset           start a new session (the old one stays"\
+                 "resumable)"
+            echo "/auto            toggle running commands without"\
+                 "confirmation (now: $AUTO)"
             echo "/exit            quit (or Ctrl-D)" ;;
     *) auto_compact          # must run before the new message joins the history
        append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"
@@ -620,5 +694,6 @@ while true; do
   input=""
 done
 
-[[ -f "$(session_file)" ]] && echo "Session saved. Resume with: agent.sh -c  (or -r $SESSION_ID)" >&2
+[[ -f "$(session_file)" ]] &&
+  echo "Session saved. Resume with: agent.sh -c  (or -r $SESSION_ID)" >&2
 exit 0
