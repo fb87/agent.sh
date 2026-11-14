@@ -24,7 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt came from.
 - A fresh session (no `-c`/`-r`) prints the `/about` card as a banner.
 - The first run creates `$XDG_CONFIG_HOME/agent.sh/prompts/` and copies the
-  bundled prompts into it; an existing directory or file is left untouched.
+  bundled prompts into it as `NAME.md.example`, ready to rename when you want
+  to override one. The directory is created once; existing files are left
+  untouched.
+- Read-only `explore` sub-agents: the model can start separate read-only
+  `agent.sh` children that inspect the project and report back. Several run in
+  parallel (`SUB_MAX`, default 4) and are bounded by `SUB_TIMEOUT` (300) and
+  `SUB_MAX_STEPS` (25); `SUBAGENTS=0` removes the tool, and `EXPLORE.md` can
+  replace the explorer instructions.
+- `AGENTS.md` in the working directory is added to the system prompt (up to
+  20 KB) so project instructions apply automatically; `PROJECT_DOC=0` turns
+  this off.
+- `-b`/`--build` (build mode, the default; the last of `-p`/`-b` wins) and
+  `-i` (stay in the REPL after a command-line prompt). A one-shot run now
+  exits non-zero when its turn fails.
+- `MAX_STEPS` caps the tool rounds of one main-agent turn; at the limit the
+  model is asked for a final answer instead of being cut off mid-turn.
+- `CMD_TIMEOUT` (600 seconds) stops a command that runs too long when
+  `timeout` is available. Commands run in their own process group, so Ctrl-C
+  or exit stops what they started, not just the shell.
+- A missing `jq` or `curl` is taken from the Nix store when possible; otherwise
+  `agent.sh` says what to install and stops.
 
 ### Changed
 
@@ -34,6 +54,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PROMPT_DIR` no longer defaults to `./pro.mpts`; the script looks next to
   itself, so prompts are found when it is run from another directory or from
   a Nix profile. Set `PROMPT_DIR` to keep pointing at a specific tree.
+- The API key is unset from the environment of commands the model runs and
+  handed to `curl` in a header file rather than on its command line. State,
+  history and scratch files are created private (`umask 077`).
+- Generated prompt files use the `NAME.md.example` suffix, so they do not
+  shadow the bundled prompt and hide its updates.
+- Automatic compaction also runs between tool steps of a long turn. The
+  latest exchange is kept verbatim when it is small enough and everything
+  before it becomes the summary.
+- `/resume` re-applies the current mode and working-directory context, so a
+  session saved in the other mode or directory is brought in step.
+- Plan-mode command filtering is stricter about quoting, redirections and
+  `git` subcommands.
+
+### Fixed
+
+- Scratch files live beside the sessions instead of in `/tmp`, so a command
+  that cleans `/tmp` cannot remove them; scratch directories left by a killed
+  run are cleaned up on the next start.
+- The readline history file is kept at mode `0600`.
+- Explorers are stopped when their parent is interrupted or exits, and a
+  turn stopped by Ctrl-C no longer reports success in one-shot mode.
 
 ## [0.2.0] - 2026-11-13
 

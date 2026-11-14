@@ -2,16 +2,19 @@
 # vim: set ts=2 sw=2 sts=2 et ai tw=80 cc=80 ft=sh :
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
-# Usage: agent.sh [-y] [-p] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
+# Usage: agent.sh [-y] [-p | -b] [-i] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
 #        agent.sh -l [all]
 #   -y       run commands without asking (same as AUTO=1)
-#   -p       start in plan mode: read-only commands, no edits (/build)
+#   -p       start in plan mode: read-only commands, no edits (--plan)
+#   -b       start in build mode, the default (--build); the last one wins
+#   -i       with a prompt: stay in the REPL afterwards instead of exiting
 #   -c       continue the most recent session in this directory
 #   -r ID    resume a specific session (full id or a unique prefix)
 #   -l       list saved sessions for this directory ("all": every directory)
 #   -h       show this help (--help works too)
 #   -V       show the version (--version works too)
-#   prompt   optional first message (put -- before one that starts with '-')
+#   prompt   optional first message; the agent answers it and exits (one-shot)
+#            unless -i is given (put -- before a prompt that starts with '-')
 #
 # REPL commands: /help  /about  /model  /compact  /sessions [all]
 #                /resume ID  /reset  /auto  /plan  /build  /exit (Ctrl-D)
@@ -22,17 +25,33 @@
 # There are two modes. Build (the default) edits files and runs commands.
 # Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
-# (AUTO_COMPACT=0 turns that off); /compact does it on demand.
+# (AUTO_COMPACT=0 turns that off), also in the middle of a long turn;
+# /compact does it on demand. The latest exchange is kept as it is when it
+# is small enough, and everything before it becomes the summary.
 # Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
 # "model", "url" and "api_key" (plus reasoning, thinking and temperature).
 # Environment variables win over that file.
-# The built-in prompts can be replaced by SYSTEM.md, COMPACTION.md and PLAN.md.
+# The model can also start read-only sub-agents with the "explore" tool: each
+# is a separate agent.sh that may only inspect, and several run in parallel
+# (SUB_MAX at once, 4). SUBAGENTS=0 removes the tool; SUB_TIMEOUT (300) and
+# SUB_MAX_STEPS (25) bound one explorer. MAX_STEPS bounds a turn of the main
+# agent (0 = no limit): at the limit the model is asked for its answer.
+# An AGENTS.md in the working directory is added to the system prompt
+# (PROJECT_DOC=0 turns that off).
+# The built-in prompts can be replaced by SYSTEM.md, COMPACTION.md, PLAN.md
+# and EXPLORE.md (the instructions an explorer gets).
 # They are looked up in $PROMPT_DIR (if set), then in
 # $XDG_CONFIG_HOME/agent.sh/prompts, then in <install dir>/pro.mpts; a missing
 # or blank file keeps the built-in, and {{cwd}} is the working directory.
 # On the first run the config directory is created and the bundled prompts are
-# copied into it, ready to edit; a fresh session also prints /about.
+# copied into it as NAME.md.example; rename one to NAME.md to override that
+# prompt. A fresh session also prints /about.
 # Ctrl-C stops the current reply or command without ending the session.
+# A command is stopped after CMD_TIMEOUT seconds (600; 0 = never) when the
+# "timeout" program is available.
+# jq and curl are required. If one is missing and Nix is installed, it is used
+# from the Nix store (fetched if need be); otherwise agent.sh says what to
+# install and stops.
 # Sessions are saved as JSON in $SESSION_DIR (~/.local/state/agent.sh/sessions).
 set -euo pipefail
 
@@ -49,6 +68,13 @@ AGENT_API_KEY_ENV_SET=${AGENT_API_KEY+1}
 AGENT_API_KEY_ENV="${AGENT_API_KEY-}"
 OPENCODE_API_KEY_ENV_SET=${OPENCODE_API_KEY+1}
 OPENCODE_API_KEY_ENV="${OPENCODE_API_KEY-}"
+# The key stays in this shell only: commands the model runs must not inherit
+# it (an "env" would put it in the transcript and send it to the provider).
+unset AGENT_API_KEY OPENCODE_API_KEY
+# Sessions, history and temp files hold command output and may hold secrets:
+# create them private. Commands the model runs get the original umask back.
+ORIG_UMASK=$(umask)
+umask 077
 
 MODEL="deepseek-v4.1-flash"            # can come from config or environment
 PROVIDER="opencode"                    # opencode (aka opencode-go)
@@ -62,6 +88,17 @@ MAX_OUT="${MAX_OUT:-20000}"            # tool output bytes sent to the model
 AUTO_COMPACT="${AUTO_COMPACT:-1}"      # 1 = auto-summarize a long history
 COMPACT_AT="${COMPACT_AT:-100000}"     # history bytes that trigger that
 TIMEOUT="${TIMEOUT:-300}"              # seconds of silence before giving up
+SUBAGENTS="${SUBAGENTS:-1}"            # 1 = offer the explore tool (sub-agents)
+SUB_MAX="${SUB_MAX:-4}"                # explorers running at the same time
+SUB_TIMEOUT="${SUB_TIMEOUT:-300}"      # seconds one explorer may take (0 = no cap)
+SUB_MAX_STEPS="${SUB_MAX_STEPS:-25}"   # tool rounds one explorer may use
+MAX_STEPS="${MAX_STEPS:-0}"            # tool rounds per turn (0 = no limit)
+# Set by a parent agent.sh for the explorers it starts; not a user setting.
+SUB="${AGENT_SUB:-0}"
+SUB_NAME="${AGENT_SUB_NAME:-explorer}"
+unset AGENT_SUB AGENT_SUB_NAME
+PROJECT_DOC="${PROJECT_DOC:-1}"        # 1 = add ./AGENTS.md to the system prompt
+CMD_TIMEOUT="${CMD_TIMEOUT:-600}"      # seconds one command may run (0 = no cap)
 SHOW_REASONING="${SHOW_REASONING:-1}"  # 1 = stream reasoning (dimmed)
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
 AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"   # lines kept in that file
@@ -88,9 +125,10 @@ new_id() {
     echo "bash-agent-$$-$(date +%s)"
 }
 
-# The directory the script lives in, with symlinks resolved, so a symlink in
-# ~/.local/bin or a Nix wrapper still finds the bundled pro.mpts directory.
-resolve_install_dir() {
+# The script's own path, with symlinks resolved, so a symlink in ~/.local/bin
+# or a Nix wrapper still finds the bundled pro.mpts directory beside it, and
+# explorers are started from the real file.
+resolve_self() {
   local src="${BASH_SOURCE[0]}" dir
   while [[ -L "$src" ]]; do
     dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || break
@@ -98,7 +136,7 @@ resolve_install_dir() {
     [[ "$src" == /* ]] || src="$dir/$src"
   done
   dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || dir="."
-  printf '%s' "$dir"
+  printf '%s/%s' "$dir" "$(basename "$src")"
 }
 
 # The endpoint for a known provider; fails for one we do not know.
@@ -241,20 +279,24 @@ build_prompt_dirs() {
   PROMPT_DIRS+=("$INSTALL_DIR/pro.mpts")
 }
 
-# First run only: create the config directory and seed its prompts with the
-# ones shipped beside the script so they can be edited. Nothing is written if
-# the directory already exists.
+# First run only: create the config directory and put the prompts shipped
+# beside the script there as NAME.md.example. They are examples, not overrides:
+# a live copy would shadow the bundled prompt for good and hide its updates.
+# Nothing is written if the directory already exists.
 init_config_dir() {
-  local src="$INSTALL_DIR/pro.mpts" f
+  local src="$INSTALL_DIR/pro.mpts" f dst
   [[ -d "$CONFIG_DIR" ]] && return 0
   mkdir -p "$CONFIG_DIR/prompts" 2>/dev/null || return 0
   [[ -d "$src" ]] || return 0
   for f in "$src"/*.md; do
     [[ -f "$f" ]] || continue
-    cp "$f" "$CONFIG_DIR/prompts/" 2>/dev/null || true
+    dst="$CONFIG_DIR/prompts/$(basename "$f").example"
+    # chmod: a copy from a read-only tree (the Nix store) is read-only too
+    cp "$f" "$dst" 2>/dev/null && chmod 644 "$dst" 2>/dev/null || true
   done
-  printf 'agent.sh: created %s and copied the prompts there\n' \
+  printf 'agent.sh: created %s with the prompts as *.md.example;' \
     "$CONFIG_DIR/prompts" >&2
+  printf ' rename one to *.md to override it\n' >&2
 }
 
 # The text of the first non-blank <prompt dir>/$1, else $2. {{cwd}} in it
@@ -279,7 +321,7 @@ read_prompt() {
 # Which prompts are in use, for /about
 prompt_notes() {
   local f n=""
-  for f in SYSTEM.md COMPACTION.md PLAN.md; do
+  for f in SYSTEM.md COMPACTION.md PLAN.md EXPLORE.md; do
     read_prompt "$f" '' >/dev/null
     if [[ "$PROMPT_FROM" != built-in ]]; then
       n+="${n:+; }$f from $PROMPT_FROM"
@@ -413,6 +455,12 @@ about() {
     printf '  %-9s only with /compact\n' compact
   fi
   printf '  %-9s %s\n' prompts "$(prompt_notes)"
+  printf '  %-9s %s\n' project "${PROJECT_DOC_USED:-no AGENTS.md here}"
+  if (( SUBAGENTS )); then
+    printf '  %-9s explore tool on, up to %s in parallel\n' explorers "$SUB_MAX"
+  else
+    printf '  %-9s off\n' explorers
+  fi
   printf '  %-9s %s, %s, %s\n' runtime \
     "bash $BASH_VERSION" "$jq_ver" "$curl_ver"
   printf '  %-9s %s\n' script "$0"
@@ -420,19 +468,32 @@ about() {
 
 RESUME=""
 LIST=0
-for arg in "$@"; do                    # getopts cannot see long options
-  case "$arg" in
-    -h|--help) usage; exit 0 ;;
+INTERACTIVE=0
+# getopts cannot see long options: take them out of the leading options first
+# and stop at the first prompt word, so "--plan" inside a prompt is just text.
+ARGS=()
+while (( $# )); do
+  case "$1" in
+    --help)    usage; exit 0 ;;
     --version) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
-    --plan) MODE=plan ;;
-    --build) MODE=build ;;
-    --) break ;;
+    --plan)    ARGS+=(-p); shift ;;       # in order, so the last one wins
+    --build)   ARGS+=(-b); shift ;;
+    --)        ARGS+=("$@"); break ;;
+    --*)       echo "agent.sh: unknown option $1 (try -h)" >&2; exit 2 ;;
+    -r|-[!-]*r)                         # -r takes the next word as its value
+               ARGS+=("$1"); shift
+               if (( $# )); then ARGS+=("$1"); shift; fi ;;
+    -?*)       ARGS+=("$1"); shift ;;
+    *)         ARGS+=("$@"); break ;;
   esac
 done
-while getopts ":ycr:lhVp" opt; do
+set -- ${ARGS[@]+"${ARGS[@]}"}
+while getopts ":ycr:lhVpbi" opt; do
   case "$opt" in
     y) AUTO=1 ;;
     p) MODE=plan ;;
+    b) MODE=build ;;
+    i) INTERACTIVE=1 ;;
     c) RESUME=last ;;
     r) [[ -n "$OPTARG" ]] ||
          { echo "agent.sh: -r needs a session id" >&2; exit 2; }
@@ -445,18 +506,82 @@ while getopts ":ycr:lhVp" opt; do
   esac
 done
 shift $((OPTIND - 1))
+# Makes sure program $1 can be run, before anything needs it. If it is not on
+# PATH but Nix is here, it is taken from the Nix store: a copy that is already
+# there first (no download), else Nix is asked to fetch it. Otherwise the user
+# is told what is missing and how to get it.
+need() {
+  local prog="$1" store="${NIX_STORE_DIR:-/nix/store}" p found="" out line
+  command -v "$prog" >/dev/null 2>&1 && return 0
+  if [[ -d "$store" ]]; then
+    # e.g. /nix/store/<hash>-jq-1.7.1-bin/bin/jq
+    for p in "$store"/*-"$prog"-[0-9]*/bin/"$prog"; do
+      if [[ -x "$p" ]]; then found="$p"; fi
+    done
+  fi
+  if [[ -z "$found" ]] && command -v nix >/dev/null 2>&1; then
+    printf "agent.sh: '%s' is not installed; getting it with Nix...\n" \
+      "$prog" >&2
+    out=$(nix build --no-link --print-out-paths \
+            --extra-experimental-features 'nix-command flakes' \
+            "nixpkgs#$prog" 2>/dev/null) || out=""
+    if [[ -z "$out" ]] && command -v nix-build >/dev/null 2>&1; then
+      out=$(nix-build '<nixpkgs>' -A "$prog" --no-out-link 2>/dev/null) ||
+        out=""
+    fi
+    while IFS= read -r line; do           # one line per output (bin, man, ...)
+      if [[ -n "$line" && -x "$line/bin/$prog" ]]; then
+        found="$line/bin/$prog"; break
+      fi
+    done <<<"$out"
+  fi
+  if [[ -n "$found" ]]; then
+    PATH="${found%/*}:$PATH"
+    export PATH
+    printf "agent.sh: using %s from the Nix store (%s)\n" "$prog" "$found" >&2
+    return 0
+  fi
+  printf "agent.sh: '%s' is required but was not found.\n" "$prog" >&2
+  if command -v nix >/dev/null 2>&1; then
+    printf '  Nix could not provide it either (no network?). Try:\n' >&2
+    printf '    nix profile install nixpkgs#%s\n' "$prog" >&2
+  else
+    printf '  Install it and run agent.sh again, for example:\n' >&2
+    printf '    apt install %s | dnf install %s | brew install %s\n' \
+      "$prog" "$prog" "$prog" >&2
+    printf '    nix profile install nixpkgs#%s\n' "$prog" >&2
+  fi
+  exit 1
+}
+need jq
+need curl
+
 if (( LIST )); then list_sessions "${1:-}"; exit 0; fi
 FIRST_PROMPT="$*"
+ONESHOT=0                              # a prompt on the command line: answer, exit
+if [[ -n "$FIRST_PROMPT" ]] && (( ! INTERACTIVE )); then ONESHOT=1; fi
+if [[ "$SUB" == 1 ]]; then              # an explorer: read-only, never asks
+  MODE=plan; AUTO=1; SUBAGENTS=0; MAX_STEPS="$SUB_MAX_STEPS"
+  [[ -n "$FIRST_PROMPT" ]] ||
+    { echo "agent.sh: an explorer needs a task" >&2; exit 2; }
+  ONESHOT=1
+else
+  SUB=0
+fi
+for dep in SUB_MAX SUB_TIMEOUT SUB_MAX_STEPS MAX_STEPS; do
+  [[ "${!dep}" =~ ^[0-9]+$ ]] ||
+    { echo "agent.sh: $dep must be a whole number" >&2; exit 2; }
+done
+[[ "$SUBAGENTS" == 0 || "$SUBAGENTS" == 1 ]] ||
+  { echo "agent.sh: SUBAGENTS must be 0 or 1" >&2; exit 2; }
+(( SUB_MAX > 0 )) || SUB_MAX=1
 case "$MODE" in
   build|plan) ;;
   *) echo "agent.sh: MODE must be 'build' or 'plan'" >&2; exit 2 ;;
 esac
 
-for dep in jq curl; do
-  command -v "$dep" >/dev/null ||
-    { echo "agent.sh: '$dep' is required" >&2; exit 1; }
-done
-INSTALL_DIR=$(resolve_install_dir)
+SELF=$(resolve_self)
+INSTALL_DIR=$(dirname "$SELF")
 build_prompt_dirs
 init_config_dir
 load_settings
@@ -466,7 +591,11 @@ SYSTEM_DEFAULT="You are a coding agent working in the user's current directory
 ($PWD). Use the bash tool to inspect, create, edit and run files. Each command
 runs in a fresh non-interactive bash process with no stdin, so 'cd' and
 variables do not persist between calls and interactive programs will not work.
-Be concise."
+A command returns only when everything it started has closed its output, so
+send a background job's output to a file (cmd >log 2>&1 &). If you have the
+explore tool, use it to look into several independent things at once. Stop
+processes by PID, never by a name that could match your own shell (pkill bash,
+killall, kill -1). Be concise."
 PLAN_DEFAULT='PLAN MODE: plan only, do not change anything. Inspect the '
 PLAN_DEFAULT+='project with read-only commands (ls, cat, head, tail, grep, '
 PLAN_DEFAULT+='git status/diff/log/show, ...); other commands are refused '
@@ -476,12 +605,32 @@ PLAN_DEFAULT+='concrete, step-by-step plan: the files to change, the exact '
 PLAN_DEFAULT+='edits, and how to verify them. Say what you would do, not '
 PLAN_DEFAULT+='what you did.'
 BASE_SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
+# Project instructions: ./AGENTS.md joins the system prompt (PROJECT_DOC=0
+# turns that off). Capped, so a huge file cannot eat the context.
+PROJECT_DOC_USED=""
+if [[ "$PROJECT_DOC" != 0 && -f AGENTS.md && -r AGENTS.md ]]; then
+  doc=$(head -c 20000 AGENTS.md | tr -d '\0')
+  if [[ -n "${doc//[[:space:]]/}" ]]; then
+    BASE_SYSTEM+=$'\n\n'"Project instructions from $PWD/AGENTS.md:"$'\n'"$doc"
+    PROJECT_DOC_USED="$PWD/AGENTS.md"
+  fi
+fi
 PLAN_PROMPT=$(read_prompt PLAN.md "$PLAN_DEFAULT")
+EXPLORE_DEFAULT='You are an explorer: a read-only sub-agent working for '
+EXPLORE_DEFAULT+='another agent, which gave you the task below and cannot see '
+EXPLORE_DEFAULT+='anything you do except your final message. Inspect the '
+EXPLORE_DEFAULT+='project with read-only commands (ls, cat, head, tail, grep, '
+EXPLORE_DEFAULT+='find, git log/show/diff, ...); other commands are refused by '
+EXPLORE_DEFAULT+='the harness. Do not ask questions. Use few steps, then end '
+EXPLORE_DEFAULT+='with a short report: what you found, with file paths and '
+EXPLORE_DEFAULT+='line numbers, the facts the task asked for, and what you '
+EXPLORE_DEFAULT+='could not determine. Report only what you saw.'
+EXPLORE_PROMPT=$(read_prompt EXPLORE.md "$EXPLORE_DEFAULT")
 SYSTEM="$BASE_SYSTEM"
 
-# OpenAI-style tool definition
+# OpenAI-style tool definitions
 # Built with jq: a JSON string cannot be broken across lines
-TOOLS=$(jq -cn '
+TOOLS=$(jq -cn --argjson sub "$SUBAGENTS" '
   [{type: "function", function: {
     name: "bash",
     description: ("Run a bash script in the current directory. Returns " +
@@ -489,10 +638,72 @@ TOOLS=$(jq -cn '
     parameters: {type: "object",
       properties: {command: {type: "string",
         description: "The bash command or script to run"}},
-      required: ["command"]}}}]')
+      required: ["command"]}}}]
+  + (if $sub == 1 then
+  [{type: "function", function: {
+    name: "explore",
+    description: ("Start a read-only sub-agent that explores the project " +
+                  "and returns a report. It can only run read-only commands " +
+                  "and does not see this conversation, so give it a " +
+                  "self-contained task: what to find out, where to look, " +
+                  "and what to report. Several explore calls in one reply " +
+                  "run in parallel: split a broad search into independent " +
+                  "tasks. Use bash yourself for a quick single lookup."),
+    parameters: {type: "object",
+      properties: {task: {type: "string",
+        description: "What the explorer should find out and report"}},
+      required: ["task"]}}}]
+  else [] end)')
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# Scratch files live beside the sessions, not in /tmp: a command that cleans
+# /tmp must not take the agent's files with it. The directory name carries our
+# pid, so a later run can remove what a killed one left behind.
+RUN_BASE="${SESSION_DIR%/*}"
+mkdir -p "$RUN_BASE" 2>/dev/null || true
+for dep in "$RUN_BASE"/run.*; do
+  [[ -d "$dep" ]] || continue
+  pid=${dep##*/run.}; pid=${pid%%.*}
+  [[ "$pid" =~ ^[0-9]+$ ]] || continue
+  kill -0 "$pid" 2>/dev/null || rm -rf "$dep" 2>/dev/null || true
+done
+TMP=$(mktemp -d "$RUN_BASE/run.$$.XXXXXX" 2>/dev/null) || TMP=$(mktemp -d)
+CMD_PID=""                 # process group of the command now running, if any
+on_exit() {
+  if [[ -n "$CMD_PID" ]]; then kill -TERM -- "-$CMD_PID" 2>/dev/null || true; fi
+  if declare -F sub_kill_all >/dev/null; then sub_kill_all; fi
+  rm -rf "$TMP"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP        # terminal closed: leave through on_exit
+# An explorer is stopped by its parent with TERM: take the command with it
+if (( SUB )); then trap 'exit 143' TERM; fi
+
+# Puts back the scratch directory and the key file if a command removed them.
+# The key goes to curl in a file: on the command line any user could read it
+# with ps. printf is a builtin, so it does not show up there either.
+ensure_tmp() {
+  [[ -d "$TMP" ]] || mkdir -p "$TMP" 2>/dev/null || true
+  [[ -s "$TMP/auth" ]] ||
+    printf 'Authorization: Bearer %s\n' "$API_KEY" >"$TMP/auth" 2>/dev/null ||
+    true
+}
+ensure_tmp
+# "timeout" caps a command's run time where it exists (gtimeout: macOS with
+# coreutils). "setsid" gives a command its own session; without it, job
+# control gives it at least its own process group.
+TIMEOUT_BIN=""
+for dep in timeout gtimeout; do
+  if command -v "$dep" >/dev/null 2>&1 && "$dep" 5 true >/dev/null 2>&1; then
+    TIMEOUT_BIN="$dep"; break
+  fi
+done
+SETSID_BIN=""
+if command -v setsid >/dev/null 2>&1 && setsid true >/dev/null 2>&1; then
+  SETSID_BIN=setsid
+fi
+START_DIR="$PWD"
+[[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] ||
+  { echo "agent.sh: CMD_TIMEOUT must be a whole number of seconds" >&2; exit 2; }
 # Ctrl-C kills the foreground child (curl / the command) but not the agent
 INTERRUPTED=0
 trap 'INTERRUPTED=1' INT
@@ -503,6 +714,7 @@ session_file() { printf '%s/%s.json' "$SESSION_DIR" "$SESSION_ID"; }
 
 save_session() {
   local f; f=$(session_file)
+  [[ -d "$SESSION_DIR" ]] || mkdir -p "$SESSION_DIR" 2>/dev/null || true
   if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" \
          '{id: $id, cwd: $cwd, messages: .}' \
          <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null ||
@@ -520,7 +732,11 @@ new_history() {
 apply_mode() {
   MODE="$1"
   SYSTEM="$BASE_SYSTEM"
-  [[ "$MODE" == plan ]] && SYSTEM+=$'\n\n'"$PLAN_PROMPT"
+  if (( SUB )); then
+    SYSTEM+=$'\n\n'"$EXPLORE_PROMPT"
+  elif [[ "$MODE" == plan ]]; then
+    SYSTEM+=$'\n\n'"$PLAN_PROMPT"
+  fi
   [[ -n "${MESSAGES:-}" ]] || return 0
   MESSAGES=$(jq -c --arg s "$SYSTEM" '
     if (.[0].role // "") == "system" then .[0].content = $s else . end' \
@@ -599,6 +815,7 @@ load_session() {
 }
 
 mkdir -p "$SESSION_DIR"
+chmod 700 "$SESSION_DIR" 2>/dev/null || true   # also one made by an older version
 if [[ -n "$RESUME" ]]; then
   if [[ "$RESUME" == last ]]; then
     RESUME=$(find_last_session) ||
@@ -608,7 +825,7 @@ if [[ -n "$RESUME" ]]; then
 else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
   new_history
-  about                                  # banner on a fresh start
+  (( SUB )) || about                     # banner on a fresh start
 fi
 apply_mode "$MODE"
 
@@ -711,21 +928,23 @@ assemble() { jq -Rn --argjson partial "${1:-false}" "$ASSEMBLE" <"$TMP/sse"; }
 http_post() {
   curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
     -D "$TMP/hdr" "$URL" \
-    -H "Authorization: Bearer $API_KEY" \
+    -H @"$TMP/auth" \
     -H "Content-Type: application/json" \
     -H "Accept: text/event-stream" \
     -H "x-opencode-session: $SESSION_ID" \
     -d @-
 }
 
-# Sends $1 (a messages array), leaves the raw stream in $TMP/sse. $2 = quiet
-# keeps the reply off the screen (compaction), otherwise it is streamed as it
-# arrives. Retries only when nothing arrived or the server asks to retry, never
+# Sends $1 (a messages array), leaves the raw stream in $TMP/sse. $2 is a list
+# of flags: "quiet" keeps the reply off the screen, otherwise it is streamed as
+# it arrives; "notools" sends no tool definitions, so the reply is text. Retries only when nothing arrived or the server asks to retry, never
 # after part of a reply was already shown.
 request() {
-  local msgs="$1" quiet="${2:-}" attempt code body
+  local msgs="$1" flags=" ${2:-} " attempt code body notools=0
+  ensure_tmp
+  if [[ "$flags" == *" notools "* ]]; then notools=1; fi
   body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-    --arg mode "$quiet" --arg reasoning "$REASONING" \
+    --argjson notools "$notools" --arg reasoning "$REASONING" \
     --arg thinking "$THINKING" --arg temperature "$TEMPERATURE" \
     '{model: $model}
      + (if $reasoning == "" then {} else {reasoning_effort: $reasoning} end)
@@ -735,10 +954,10 @@ request() {
      + (if $temperature == "" then {}
         else {temperature: ($temperature | tonumber)} end)
      + {messages: ., stream: true}
-     + (if $mode == "quiet" then {} else {tools: $tools} end)' <<<"$msgs")
+     + (if $notools == 1 then {} else {tools: $tools} end)' <<<"$msgs")
   for attempt in 1 2 3 4; do
     : >"$TMP/sse"; : >"$TMP/hdr"
-    if [[ "$quiet" == quiet ]]; then
+    if [[ "$flags" == *" quiet "* ]]; then
       printf '%s' "$body" | http_post | tee "$TMP/sse" >/dev/null || true
     else
       printf '%s' "$body" | http_post | tee "$TMP/sse" | show_stream || true
@@ -754,7 +973,9 @@ request() {
   done
 }
 
-call_api() { request "$MESSAGES"; }
+# An explorer's replies stay off the screen: only its report is printed
+call_api() { if (( SUB )); then request "$MESSAGES" quiet
+             else request "$MESSAGES"; fi; }
 
 # ---------------------------------------------------------------- compacting
 
@@ -767,19 +988,32 @@ COMPACT_DEFAULT+='the current state, and what is left to do. Output the '
 COMPACT_DEFAULT+='summary only, no preamble.'
 COMPACT_ASK=$(read_prompt COMPACTION.md "$COMPACT_DEFAULT")
 
-# Folds the conversation into one summary message (system + summary). The old
-# transcript is left next to the session file as <id>.json.bak.
+# Folds the conversation into a summary. Everything from the last user message
+# on is kept word for word when it is at most half of COMPACT_AT, so the model
+# does not lose the exact state of what it is doing; otherwise the whole
+# conversation is folded. The old transcript is left next to the session file
+# as <id>.json.bak. $1 = mid when called between two steps of a turn.
 compact() {
-  local msgs result summary count before after
+  local when="${1:-}" parts msgs result summary count kept before after
+  local folded
   INTERRUPTED=0            # a Ctrl-C that ended the previous turn is not ours
   count=$(jq '[.[] | select(.role != "system")] | length' <<<"$MESSAGES")
   if (( count == 0 )); then
     echo "Nothing to compact yet."
     return 1
   fi
-  msgs=$(jq -c --arg q "$COMPACT_ASK" "$REPAIR"'
-      | . + [{role: "user", content: $q}]' <<<"$MESSAGES")
-  request "$msgs" quiet
+  parts=$(jq -c --argjson max "$(( COMPACT_AT / 2 ))" "$REPAIR"'
+      | ([to_entries[] | select(.value.role == "user") | .key] | last // 0)
+          as $k
+      | if $k > 1 and ((.[$k:] | tojson | utf8bytelength) <= $max)
+        then {head: .[1:$k], tail: .[$k:]}
+        else {head: .[1:], tail: []} end' <<<"$MESSAGES") || return 1
+  count=$(jq '.head | length' <<<"$parts")
+  kept=$(jq '.tail | length' <<<"$parts")
+  msgs=$(jq -c --arg s "$SYSTEM" --arg q "$COMPACT_ASK" '
+      [{role: "system", content: $s}] + .head
+      + [{role: "user", content: $q}]' <<<"$parts")
+  request "$msgs" "quiet notools"
   if (( INTERRUPTED )); then
     echo "Compaction interrupted; the history is unchanged." >&2
     return 1
@@ -796,15 +1030,28 @@ compact() {
   before=$(printf '%s' "$MESSAGES" | wc -c)
   [[ -f "$(session_file)" ]] &&
     cp -f "$(session_file)" "$(session_file).bak" 2>/dev/null
-  MESSAGES=$(jq -cn --arg s "$SYSTEM" --arg sum "$summary" '
+  # Folded mid-turn with nothing kept, the history would end on the summary
+  # and a failed request would then drop it as an unsent message: end on a
+  # short instruction instead.
+  folded=$(jq -c --arg s "$SYSTEM" --arg sum "$summary" --arg when "$when" '
       [{role: "system", content: $s},
        {role: "user",
         content: ("Summary of the conversation so far (everything before it "
-                  + "was compacted to save context):\n\n") + $sum}]')
+                  + "was compacted to save context):\n\n" + $sum)}]
+      + .tail
+      + (if $when == "mid" and (.tail | length) == 0
+         then [{role: "user", content: "Carry on with the task."}]
+         else [] end)' <<<"$parts") || folded=""
+  if [[ -z "$folded" ]]; then          # never swap the history for nothing
+    echo "Could not compact: building the new history failed." >&2
+    return 1
+  fi
+  MESSAGES="$folded"
   save_session
   after=$(printf '%s' "$MESSAGES" | wc -c)
-  printf '(compacted %s messages, %s bytes -> one summary, %s bytes)\n' \
-    "$count" "$before" "$after"
+  printf '(compacted %s messages into a summary, kept the last %s;' \
+    "$count" "$kept"
+  printf ' %s -> %s bytes)\n' "$before" "$after"
 }
 
 # Compacts on its own once the history outgrows COMPACT_AT bytes. Never fatal:
@@ -818,98 +1065,286 @@ auto_compact() {
         2>/dev/null) || n=0
   (( n > 0 )) || return 0             # only the system prompt: nothing to fold
   printf '(history is %s bytes; compacting it first)\n' "$size" >&2
-  compact || printf '(compaction failed; carrying on)\n' >&2
+  compact "${1:-}" || printf '(compaction failed; carrying on)\n' >&2
   return 0
 }
 
 # ---------------------------------------------------------------- tools
 
-# Plan mode may only inspect. This is a guard, not a sandbox: it refuses
-# redirections, substitutions and anything whose first word it does not know.
+# >>> plan guard (tests/run.sh sources the lines between these two markers)
+# Plan mode may only inspect. This is a guard, not a sandbox: the command is
+# split into simple commands and words the way bash would split it (quotes
+# included), and it is refused unless every simple command starts with a known
+# read-only program and carries none of that program's writing options.
 PLAN_CMDS=(ls cat head tail wc grep egrep fgrep rg find file stat pwd echo
            printf cut tr diff comm cmp jq basename dirname readlink realpath
            du df which type uname date id ps seq nl od strings paste join
            expand unexpand fold tac rev sort tree md5sum sha1sum sha256sum
-           sha512sum cksum test true false '[' '[[' : cd)
+           sha512sum cksum test true false '[' '[[' ']]' : cd)
+PLAN_WORDS=()                          # filled by plan_split
+PLAN_SEP=$'\n'                         # entry that ends a simple command
+PLAN_NULL_RE='^>(&[12]|/dev/null)([[:space:];|&]|$)'
 
-# git is allowed only for subcommands that do not change the repository
+# Splits $1 into PLAN_WORDS, with a PLAN_SEP entry after each simple command.
+# Quotes are removed, so '-delete' and "-delete" are seen as the flag they are.
+# Returns 1 for anything it cannot vouch for: redirections (other than to
+# /dev/null or 2>&1), command and process substitution, subshells, brace
+# expansion, $'..' strings and unbalanced quotes.
+plan_split() {
+  local s="$1" n=${#1} i=0 c q="" w="" have=0
+  PLAN_WORDS=()
+  (( n <= 4000 )) || return 1
+  while (( i < n )); do
+    c=${s:i:1}
+    if [[ "$q" == "'" ]]; then
+      if [[ "$c" == "'" ]]; then q=""; else w+="$c"; fi
+    elif [[ "$q" == '"' ]]; then
+      case "$c" in
+        '"') q="" ;;
+        '`') return 1 ;;
+        '$') [[ "${s:i+1:1}" == "(" ]] && return 1
+             w+="$c" ;;
+        "\\") i=$((i + 1)); w+="${s:i:1}" ;;
+        *)   w+="$c" ;;
+      esac
+    else
+      case "$c" in
+        "'"|'"') q="$c"; have=1 ;;
+        "\\")    i=$((i + 1)); w+="${s:i:1}"; have=1 ;;
+        '`'|'<'|'{'|'}'|'('|')') return 1 ;;
+        '$') case "${s:i+1:1}" in "("|"'"|'"') return 1 ;; esac
+             w+="$c"; have=1 ;;
+        '>') # only "discard" and "merge stderr" are harmless
+             if [[ ( -z "$w" || "$w" == 1 || "$w" == 2 ) &&
+                   "${s:i}" =~ $PLAN_NULL_RE ]]; then
+               i=$((i + ${#BASH_REMATCH[1]}))
+               w=""; have=0
+             else
+               return 1
+             fi ;;
+        ';'|'|'|'&'|$'\n')
+             if (( have )); then PLAN_WORDS+=("$w"); fi
+             w=""; have=0
+             PLAN_WORDS+=("$PLAN_SEP") ;;
+        ' '|$'\t')
+             if (( have )); then PLAN_WORDS+=("$w"); fi
+             w=""; have=0 ;;
+        *)   w+="$c"; have=1 ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  [[ -z "$q" ]] || return 1
+  if (( have )); then PLAN_WORDS+=("$w"); fi
+  PLAN_WORDS+=("$PLAN_SEP")
+  return 0
+}
+
+# git is allowed only for subcommands that do not change the repository.
+# Arguments: the words after "git".
 plan_git_ok() {
-  local -a w; local i=1 sub=""
-  # -c / --config-env can define aliases and pagers that run commands
-  case " $1 " in
-    *" --output"*|*" -c "*|*" --config-env"*) return 1 ;;
-    *" -O "*|*" --open-files-in-pager"*) return 1 ;;
-  esac
-  read -ra w <<<"$1"
-  while (( i < ${#w[@]} )); do
-    case "${w[i]}" in
-      -C|-c) (( i += 2 )) ;;
-      -*)    (( i += 1 )) ;;
-      *)     sub=${w[i]}; break ;;
+  local a sub="" list=0
+  # -c / --config-env can define aliases and pagers that run commands; the
+  # others write a file or start a program
+  for a; do
+    case "$a" in
+      -c|--config-env*|--output*|-O*|--open-files-in-pager*|--ext-diff)
+        return 1 ;;
+    esac
+  done
+  while (( $# )); do
+    case "$1" in
+      -C) shift; if (( $# )); then shift; fi ;;
+      -*) shift ;;
+      *)  sub=$1; shift; break ;;
     esac
   done
   case "$sub" in
     status|diff|log|show|blame|ls-files|ls-tree|ls-remote|rev-parse|grep|\
     cat-file|show-ref|shortlog|describe|for-each-ref)
       return 0 ;;
-    branch) case "${w[i+1]:-}" in
-              ""|-a|-r|-v|-vv|--list|--show-current|--contains|--merged)
-                return 0 ;;
-              *) return 1 ;;
-            esac ;;
-    tag) case "${w[i+1]:-}" in ""|-l|--list|-n*) return 0 ;;
+    branch|tag)
+      # Listing only. A bare name creates a branch or tag unless an option
+      # that implies list mode is present, so names need one of those.
+      for a; do
+        case "$a" in
+          -l|--list|--contains*|--no-contains*|--merged*|--no-merged*|\
+          --points-at*) list=1 ;;
+          -n*) if [[ "$sub" == tag ]]; then list=1; else return 1; fi ;;
+          -a|-r|-v|-vv|--all|--remotes|--verbose|--show-current|--sort=*|\
+          --format=*|--column*|--no-column|-i|--ignore-case|--color*|\
+          --no-color)
+            if [[ "$sub" == tag ]]; then
+              case "$a" in -a|-r|-v|-vv|--all|--remotes|--verbose) return 1 ;;
+              esac
+            fi ;;
+          -*) return 1 ;;
+        esac
+      done
+      for a; do
+        case "$a" in
+          -*) ;;
+          *)  (( list )) || return 1 ;;
+        esac
+      done
+      return 0 ;;
+    remote) case "${1:-}" in ""|-v|--verbose|show|get-url) return 0 ;;
             *) return 1 ;; esac ;;
-    remote) case "${w[i+1]:-}" in ""|-v|--verbose|show|get-url) return 0 ;;
-            *) return 1 ;; esac ;;
-    config) case "${w[i+1]:-}" in
+    config) case "${1:-}" in
               -l|--list|--get|--get-all|--get-regexp|--get-urlmatch) return 0 ;;
               *) return 1 ;;
             esac ;;
-    stash) case "${w[i+1]:-}" in list|show) return 0 ;; *) return 1 ;; esac ;;
-    reflog) case "${w[i+1]:-}" in ""|show) return 0 ;; *) return 1 ;; esac ;;
-    worktree|submodule) case "${w[i+1]:-}" in
+    stash) case "${1:-}" in list|show) return 0 ;; *) return 1 ;; esac ;;
+    reflog) case "${1:-}" in ""|show) return 0 ;; *) return 1 ;; esac ;;
+    worktree|submodule) case "${1:-}" in
               list|status|summary) return 0 ;; *) return 1 ;; esac ;;
     *) return 1 ;;
   esac
 }
 
+# One simple command, as words: the program, then its arguments
+plan_simple_ok() {
+  local prog="$1" a c
+  shift
+  case "$prog" in
+    git) plan_git_ok "$@"; return ;;
+    find) for a; do
+            case "$a" in
+              -delete|-exec|-execdir|-ok|-okdir|-fprint*|-fls) return 1 ;;
+            esac
+          done ;;
+    sort|tree)                          # -o FILE, -oFILE, -uo FILE, --output
+          for a; do
+            case "$a" in --o*|-[!-]*o*|-o*) return 1 ;; esac
+          done ;;
+    date) for a; do
+            case "$a" in -s*|--s*) return 1 ;; esac
+          done ;;
+    rg)   for a; do
+            case "$a" in --pre*) return 1 ;; esac
+          done ;;
+  esac
+  for c in "${PLAN_CMDS[@]}"; do
+    [[ "$c" == "$prog" ]] && return 0
+  done
+  return 1
+}
+
 plan_allows() {
-  local cmd="$1" frag w c open="\$(" ok=""
-  case "$cmd" in *'>'*|*'<'*|*'`'*|*"$open"*) return 1 ;; esac
-  while IFS= read -r frag; do
-    frag=${frag#"${frag%%[![:space:]]*}"}
-    [[ -z "$frag" ]] && continue
-    w=${frag%%[[:space:]]*}
-    case "$w" in
-      git) plan_git_ok "$frag" || return 1; continue ;;
-      find) case " $frag " in
-              *" -delete "*|*" -exec "*|*" -execdir "*|*" -ok "*|*" -fprint"*)
-                return 1 ;;
-            esac ;;
-      sort|tree) case " $frag " in
-              *" -o "*|*" --output "*|*--output=*) return 1 ;;
-            esac ;;
-      date) case " $frag " in *" -s "*|*" --set"*) return 1 ;; esac ;;
-      rg) case " $frag " in *" --pre "*|*" --pre="*) return 1 ;; esac ;;
-    esac
-    ok=""
-    for c in "${PLAN_CMDS[@]}"; do
-      [[ "$c" == "$w" ]] && { ok=1; break; }
-    done
-    [[ -n "$ok" ]] || return 1
-  done < <(printf '%s\n' "$cmd" | tr ';|&' '\n')
+  local w nf=0
+  local -a f=()
+  plan_split "$1" || return 1
+  for w in "${PLAN_WORDS[@]}"; do
+    if [[ "$w" == "$PLAN_SEP" ]]; then
+      if (( nf > 0 )); then
+        plan_simple_ok "${f[@]}" || return 1
+      fi
+      f=(); nf=0
+    else
+      f+=("$w"); nf=$((nf + 1))
+    fi
+  done
   return 0
 }
 
-# Runs one command; result goes in TOOL_OUT (no subshell, so Ctrl-C state
+# <<< plan guard
+
+# The text of file $1 for the model, in CLIPPED: at most MAX_OUT bytes, keeping
+# the head and the tail and saying what was cut
+clip_file() {
+  local size half
+  CLIPPED=""
+  [[ -f "$1" ]] || return 0            # the command removed our scratch files
+  size=$(wc -c <"$1" 2>/dev/null) || return 0
+  if (( size > MAX_OUT )); then
+    half=$(( MAX_OUT / 2 ))
+    CLIPPED=$(head -c "$half" "$1" | tr -d '\0')
+    CLIPPED+=$'\n'"...[$(( size - MAX_OUT )) bytes truncated]..."$'\n'
+    CLIPPED+=$(tail -c "$half" "$1" | tr -d '\0')
+  else
+    CLIPPED=$(tr -d '\0' <"$1")
+  fi
+}
+
+# True if $1 would signal processes by a name that matches the agent itself, or
+# every process of the user. These cannot be made harmless from the inside
+# (SIGKILL cannot be caught), so they are refused with a hint instead.
+SELF_KILL_RE1='(^|[^[:alnum:]_])(pkill|killall)([[:space:]]+-[^[:space:]]+)*'
+SELF_KILL_RE1+='[[:space:]]+["'\'']?(ba|z|da)?sh(["'\'']|[[:space:];|&]|$)'
+SELF_KILL_RE2='(^|[^[:alnum:]_])(pkill|killall)[^;|&]*agent(\.sh)?'
+SELF_KILL_RE3='(^|[^[:alnum:]_])kill[[:space:]]+(-[[:alnum:]]+[[:space:]]+)*'
+SELF_KILL_RE3+='(--[[:space:]]+)?-1([[:space:];|&]|$)'
+kills_agent() {
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ $SELF_KILL_RE1 || "$line" =~ $SELF_KILL_RE2 ]]; then
+      return 0
+    fi
+    # "kill -9 -1" and "kill -- -1" hit everything; "kill -1 PID" is a SIGHUP
+    if [[ "$line" =~ $SELF_KILL_RE3 && ! "$line" =~ kill[[:space:]]+-1[[:space:]]+[0-9$] ]]
+    then return 0; fi
+  done <<<"$1"
+  return 1
+}
+
+# Ends the command whose process group is $1: TERM, then KILL after 2 seconds.
+# (INT would do nothing: a job started in the background ignores it.)
+stop_group() {
+  local g="$1" i=0
+  kill -TERM -- "-$g" 2>/dev/null || kill -TERM "$g" 2>/dev/null || true
+  while kill -0 "$g" 2>/dev/null && (( i < 20 )); do
+    sleep 0.1 || true
+    i=$((i + 1))
+  done
+  kill -KILL -- "-$g" 2>/dev/null || true
+}
+
+# Runs one command; result goes in TOOL_OUT.
+#
+# The command must not be able to take the agent down with it, so it runs
+# apart from us:
+# - in its own session (setsid) or at least its own process group, so
+#   "kill 0", a script's "trap 'kill 0' EXIT" and signals to its group stop
+#   at the command; with setsid it also has no terminal to grab or garble;
+# - behind a wrapper shell, so its $PPID is that wrapper and not the agent;
+# - with SIGTERM to the agent held off while it runs (and reported);
+# - with our scratch files and working directory put back if it removed them.
+# Ctrl-C and the timeout end the whole group, background jobs included. (no subshell, so Ctrl-C state
 # survives)
 run_tool() {
-  local cmd="$1" ok="" rc=0 out size half note=""
-  printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
+  # fd 9 is where the command and the notes about it are shown: our stderr, or
+  # nowhere for an explorer. (A dup, not a path: opening /dev/stderr again
+  # would truncate a log file that stderr was redirected to.) The command
+  # itself does not get it, or its background jobs would hold our output open.
+  if (( SUB )); then exec 9>/dev/null; else exec 9>&2; fi
+  run_tool_body "$1"
+  exec 9>&-
+}
+
+run_tool_body() {
+  local cmd="$1" ok="" rc=0 out note="" tpid i=0 left=""
+  local got_term=0 gone=""
+  local -a run=()
+  if (( SUB )); then
+    # One dim line per command; the parent's terminal is shared with others
+    printf '\033[2m[%s] $ %s\033[0m\n' "$SUB_NAME" "${cmd%%$'\n'*}" >&2
+  else
+    printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
+  fi
   if [[ "$MODE" == plan ]] && ! plan_allows "$cmd"; then
     TOOL_OUT="Plan mode: command not run. Only read-only inspection"
-    TOOL_OUT+=" commands are allowed here; /build leaves plan mode."
-    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&2
+    TOOL_OUT+=" commands are allowed here"
+    if (( SUB )); then TOOL_OUT+="."; else TOOL_OUT+="; /build leaves plan mode."
+    fi
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+    return
+  fi
+  if kills_agent "$cmd"; then
+    TOOL_OUT="Not run: this would signal processes by a name that matches the"
+    TOOL_OUT+=" agent itself (or every process you own) and could end this"
+    TOOL_OUT+=" session. Find the exact process (pgrep -af NAME, ps) and kill"
+    TOOL_OUT+=" it by PID instead."
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
     return
   fi
   if [[ "$AUTO" != 1 ]]; then
@@ -919,44 +1354,219 @@ run_tool() {
       printf '%s\n' "$TOOL_OUT" >&2
       return
     fi
-    read -rp "Run it? [y/N] " ok </dev/tty || ok=""
-    if [[ ! "$ok" =~ ^[Yy] ]]; then
-      TOOL_OUT="The user declined to run this command."
-      printf '%s\n' "$TOOL_OUT" >&2
+    read -rp "Run it? [y/N/a=always, or say why not] " ok </dev/tty || ok=""
+    case "$ok" in
+      [Yy]|[Yy][Ee][Ss]) ;;
+      [Aa]|[Aa]lways)
+        AUTO=1
+        echo "Commands now run without asking (/auto to undo)." >&2 ;;
+      ""|[Nn]|[Nn][Oo])
+        TOOL_OUT="The user declined to run this command."
+        printf '%s\n' "$TOOL_OUT" >&2
+        return ;;
+      *)  # anything else is the reason, passed on so the model can adjust
+        TOOL_OUT="The user declined to run this command and said: $ok"
+        printf '%s\n' "$TOOL_OUT" >&2
+        return ;;
+    esac
+  fi
+  # A command may have removed the directory we work in or our scratch files
+  ensure_tmp
+  if ! cd "$START_DIR" 2>/dev/null; then
+    if mkdir -p "$START_DIR" 2>/dev/null && cd "$START_DIR" 2>/dev/null; then
+      gone="[note: the working directory $START_DIR had been removed; it was"
+      gone+=" created again, empty]"
+    else
+      TOOL_OUT="Not run: the working directory $START_DIR no longer exists"
+      TOOL_OUT+=" and could not be created again."
+      printf '\033[31m%s\033[0m\n' "$TOOL_OUT" >&9
       return
     fi
   fi
   # Run from a file: passing the script via 'bash -c' would hit the argv limit
-  printf '%s\n' "$cmd" >"$TMP/cmd.sh"
   # Stream output live to the terminal while saving it to a file, so partial
-  # output survives Ctrl-C and huge output never has to fit in a variable
-  # ${PIPESTATUS[0]} is the command's own status: under pipefail, $? is tee's
-  # when the output was not delivered (e.g. 'agent.sh ... | head'), which used
-  # to report a failed command that had in fact succeeded
-  if ! bash "$TMP/cmd.sh" </dev/null 2>&1 | tee "$TMP/out" >&2; then
-    rc=${PIPESTATUS[0]}
+  # output survives Ctrl-C and huge output never has to fit in a variable.
+  # The output goes through a fifo, not a pipeline, so a background job that
+  # keeps the output open cannot make us wait for it.
+  rm -f "$TMP/fifo" 2>/dev/null || true
+  if ! printf '%s\n' "$cmd" >"$TMP/cmd.sh" || ! : >"$TMP/out" ||
+     ! mkfifo "$TMP/fifo"; then
+    TOOL_OUT="Not run: the agent could not write its scratch files in $TMP."
+    printf '\033[31m%s\033[0m\n' "$TOOL_OUT" >&2
+    return
   fi
-
-  size=$(wc -c <"$TMP/out")
-  if (( size > MAX_OUT )); then           # keep head and tail, say what was cut
-    half=$(( MAX_OUT / 2 ))
-    out=$(head -c "$half" "$TMP/out" | tr -d '\0')
-    out+=$'\n'"...[$(( size - MAX_OUT )) bytes truncated]..."$'\n'
-    out+=$(tail -c "$half" "$TMP/out" | tr -d '\0')
+  tee "$TMP/out" <"$TMP/fifo" >&9 2>/dev/null 9>&- &
+  tpid=$!
+  if [[ -n "$TIMEOUT_BIN" ]] && (( CMD_TIMEOUT > 0 )); then
+    run+=("$TIMEOUT_BIN" -k 5 "$CMD_TIMEOUT")
+  fi
+  # No exec in the wrapper: it stays as the command's parent
+  run+=(bash -c 'umask "$1"; bash "$2"' _ "$ORIG_UMASK" "$TMP/cmd.sh")
+  # The main agent holds off SIGTERM while the command runs; an explorer must
+  # stay stoppable by its parent, and its commands are read-only anyway.
+  if (( ! SUB )); then trap 'got_term=1' TERM; fi
+  if [[ -n "$SETSID_BIN" ]]; then
+    "$SETSID_BIN" "${run[@]}" </dev/null >"$TMP/fifo" 2>&1 9>&- &
   else
-    out=$(tr -d '\0' <"$TMP/out")
+    set -m
+    "${run[@]}" </dev/null >"$TMP/fifo" 2>&1 9>&- &
+    set +m
   fi
+  CMD_PID=$!
+  # wait returns early when a signal arrives: go back to it unless the command
+  # is really gone or the user pressed Ctrl-C
+  while true; do
+    rc=0
+    wait "$CMD_PID" 2>/dev/null || rc=$?
+    kill -0 "$CMD_PID" 2>/dev/null || break
+    if (( INTERRUPTED )); then
+      stop_group "$CMD_PID"
+      wait "$CMD_PID" 2>/dev/null || true
+      break
+    fi
+  done
+  # A timeout or Ctrl-C ends what the command left running as well; a normal
+  # end leaves background jobs (a server the model started) alone
+  if (( INTERRUPTED || rc == 124 )); then
+    kill -TERM -- "-$CMD_PID" 2>/dev/null || true
+  fi
+  CMD_PID=""
+  if (( ! SUB )); then trap - TERM; fi
+  cd "$START_DIR" 2>/dev/null || true
+
+  # tee ends as soon as the last writer is gone. If something the command left
+  # running still holds the output after 2 seconds, stop listening to it.
+  while kill -0 "$tpid" 2>/dev/null && (( i < 20 )); do
+    sleep 0.1 || true
+    i=$((i + 1))
+  done
+  if kill -0 "$tpid" 2>/dev/null; then
+    kill "$tpid" 2>/dev/null || true
+    left=1
+  fi
+  wait "$tpid" 2>/dev/null || true
+
+  clip_file "$TMP/out"
+  out="$CLIPPED"
   out="${out:-(no output)}"
+  ensure_tmp
   if (( INTERRUPTED )); then
     note="[interrupted by the user]"
+  elif (( rc == 124 )) && [[ -n "$TIMEOUT_BIN" ]] && (( CMD_TIMEOUT > 0 )); then
+    note="[stopped: still running after ${CMD_TIMEOUT}s (CMD_TIMEOUT)]"
   elif (( rc != 0 )); then
     note="[exit code $rc]"
   fi
+  if (( got_term )); then
+    note+="${note:+ }[this command sent SIGTERM to the agent itself, which was"
+    note+=" ignored. Never signal the agent: kill other processes by PID]"
+  fi
+  if [[ -n "$gone" ]]; then note+="${note:+ }$gone"; fi
+  if [[ -n "$left" ]]; then
+    note+="${note:+ }[a background process still had the output open; its"
+    note+=" later output is not shown. Send it to a file: cmd >log 2>&1 &]"
+  fi
   if [[ -n "$note" ]]; then
     out+=$'\n'"$note"
-    printf '\033[31m%s\033[0m\n' "$note" >&2
+    printf '\033[31m%s\033[0m\n' "$note" >&9
   fi
   TOOL_OUT="$out"
+}
+
+# ---------------------------------------------------------------- explorers
+
+# An explorer is this script again, started with AGENT_SUB=1: plan mode (the
+# harness refuses anything but read-only commands), no questions, no explore
+# tool of its own, a throwaway session, and only its final message on stdout.
+# The parent starts the explore calls of one reply together, at most SUB_MAX
+# at a time, and hands each report back as that call's tool result.
+SUB_DIR="$TMP/sub"
+SUB_PIDS=()                # pid by call number
+SUB_T0=()                  # start time by call number
+SUB_QUEUE=()               # call numbers still to start
+SUB_QPOS=0
+SUB_RUNNING=0
+
+sub_kill_all() {
+  local pid
+  for pid in ${SUB_PIDS[@]+"${SUB_PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
+  SUB_QPOS=${#SUB_QUEUE[@]}              # and start no more
+}
+
+# Starts explorer number $1 on the task in $SUB_DIR/$1.task
+sub_start() {
+  local n="$1" task line
+  task=$(cat "$SUB_DIR/$n.task")
+  line=${task%%$'\n'*}
+  if (( ${#line} > 100 )); then line="${line:0:100}..."; fi
+  printf '\033[33m[explorer %s] %s\033[0m\n' "$n" "$line" >&2
+  (
+    umask "$ORIG_UMASK"
+    # The key and the settings of this run go by environment, not argv
+    export AGENT_SUB=1 AGENT_SUB_NAME="explorer $n" AGENT_API_KEY="$API_KEY"
+    export MODEL PROVIDER URL REASONING THINKING TEMPERATURE MAX_OUT TIMEOUT
+    export CMD_TIMEOUT SUB_MAX_STEPS PROJECT_DOC AUTO_COMPACT COMPACT_AT
+    export SESSION_DIR="$SUB_DIR/sessions" AGENT_HISTFILE=/dev/null
+    export SHOW_REASONING=0
+    if [[ -n "$PROMPT_DIR" ]]; then export PROMPT_DIR; fi
+    if [[ -n "$TIMEOUT_BIN" ]] && (( SUB_TIMEOUT > 0 )); then
+      exec "$TIMEOUT_BIN" -k 5 "$SUB_TIMEOUT" "$SELF" -- "Task: $task"
+    fi
+    exec "$SELF" -- "Task: $task"
+  ) </dev/null >"$SUB_DIR/$n.out" 2> >(tee "$SUB_DIR/$n.err" >&2) &
+  SUB_PIDS[n]=$!
+  SUB_T0[n]=$SECONDS
+  SUB_RUNNING=$((SUB_RUNNING + 1))
+}
+
+# Starts queued explorers while fewer than SUB_MAX are running
+sub_fill() {
+  while (( SUB_RUNNING < SUB_MAX && SUB_QPOS < ${#SUB_QUEUE[@]} )); do
+    sub_start "${SUB_QUEUE[SUB_QPOS]}"
+    SUB_QPOS=$((SUB_QPOS + 1))
+  done
+}
+
+# Waits for explorer $1; its report (or what went wrong) goes in TOOL_OUT
+sub_collect() {
+  local n="$1" pid rc=0 took why
+  pid=${SUB_PIDS[n]:-}
+  if [[ -z "$pid" ]]; then               # never started: the turn was stopped
+    TOOL_OUT="Skipped: the user interrupted."
+    return
+  fi
+  wait "$pid" 2>/dev/null || rc=$?
+  if (( INTERRUPTED )); then             # Ctrl-C ends the wait, not the child
+    sub_kill_all
+    wait "$pid" 2>/dev/null || true
+    TOOL_OUT="Explorer stopped: the user interrupted."
+    return
+  fi
+  SUB_RUNNING=$((SUB_RUNNING - 1))
+  took=$((SECONDS - ${SUB_T0[n]:-$SECONDS}))
+  clip_file "$SUB_DIR/$n.out"
+  if (( rc == 0 )) && [[ -n "${CLIPPED//[[:space:]]/}" ]]; then
+    TOOL_OUT="$CLIPPED"
+    printf '\033[33m[explorer %s] done in %ss\033[0m\n' "$n" "$took" >&2
+    printf '\033[2m%s\033[0m\n' "$CLIPPED" >&2
+  else
+    if (( rc == 124 )) && [[ -n "$TIMEOUT_BIN" ]] && (( SUB_TIMEOUT > 0 )); then
+      why="it was stopped after ${SUB_TIMEOUT}s (SUB_TIMEOUT)"
+    elif (( rc == 0 )); then
+      why="it returned no report"
+    else
+      why="exit code $rc: $(tail -n 3 "$SUB_DIR/$n.err" 2>/dev/null |
+                            tr -d '\0' | sed $'s/\033\\[[0-9;]*m//g' |
+                            tr '\n' ' ')"
+    fi
+    TOOL_OUT="The explorer failed: $why"
+    if [[ -n "${CLIPPED//[[:space:]]/}" ]]; then
+      TOOL_OUT+=$'\n'"What it printed before that:"$'\n'"$CLIPPED"
+    fi
+    printf '\033[31m[explorer %s] failed: %s\033[0m\n' "$n" "$why" >&2
+  fi
 }
 
 # ---------------------------------------------------------------- turn loop
@@ -971,9 +1581,17 @@ abort_turn() {
   esac
 }
 
-# One user turn: call the model, run its tools, repeat until it stops
+# The arguments of a tool call as an object: normally a JSON *string*, but some
+# backends send an object
+ARG='(.function.arguments | if type == "string" then fromjson? else . end)'
+TOOL_NAMES=$(jq -r '[.[].function.name] | join(", ")' <<<"$TOOLS")
+
+# One user turn: call the model, run its tools, repeat until it stops.
+# TURN_OK is 0 afterwards if the turn failed or was interrupted.
+TURN_OK=1
 run_turn() {
-  local result msg call id name cmd out
+  local result msg call id name cmd out n ncalls steps=0
+  TURN_OK=1
   while true; do
     INTERRUPTED=0
     call_api
@@ -987,6 +1605,7 @@ run_turn() {
                    | {role,
                       content: (.content + "\n[interrupted by the user]")}')
       if [[ -n "$msg" ]]; then append "$msg"; else abort_turn; fi
+      TURN_OK=0
       return
     fi
 
@@ -997,30 +1616,62 @@ run_turn() {
              | if type == "object" then (.message // tojson) else . end
              | if . == "" then "(no response)" else . end' <<<"$result" >&2
       abort_turn
+      TURN_OK=0
       return
     fi
 
     # Save the whole assistant message (keeps tool_calls and any
     # reasoning_content)
     append "$msg"
-    # Streamed text is already on screen; a non-streamed reply is not
-    [[ "$(jq -r '.streamed' <<<"$result")" == true ]] ||
-      jq -r '.content // empty' <<<"$msg"
-
     # No tool calls -> the model is done with this turn
-    [[ "$(jq '.tool_calls // [] | length' <<<"$msg")" -gt 0 ]] || return 0
+    ncalls=$(jq '.tool_calls // [] | length' <<<"$msg")
+    # Streamed text is already on screen; a non-streamed reply is not. An
+    # explorer prints nothing but its final message: that is its report.
+    if (( SUB )); then
+      (( ncalls > 0 )) || jq -r '.content // empty' <<<"$msg"
+    elif [[ "$(jq -r '.streamed' <<<"$result")" != true ]]; then
+      jq -r '.content // empty' <<<"$msg"
+    fi
+    (( ncalls > 0 )) || return 0
 
+    # Explorers first: they work in the background while the other calls of
+    # this reply run, and each is collected at its place in the order
+    SUB_PIDS=(); SUB_T0=(); SUB_QUEUE=(); SUB_QPOS=0; SUB_RUNNING=0
+    if (( SUBAGENTS )); then
+      mkdir -p "$SUB_DIR"
+      n=0
+      while IFS= read -r call; do
+        n=$((n + 1))
+        [[ "$(jq -r '.function.name' <<<"$call")" == explore ]] || continue
+        jq -r "$ARG"' | .task? // empty' <<<"$call" >"$SUB_DIR/$n.task"
+        if [[ -n "$(tr -d '[:space:]' <"$SUB_DIR/$n.task")" ]]; then
+          SUB_QUEUE+=("$n")
+        fi
+      done < <(jq -c '.tool_calls[]' <<<"$msg")
+      sub_fill
+    fi
+
+    n=0
     while IFS= read -r call; do
+      n=$((n + 1))
       id=$(jq -r '.id' <<<"$call")
       name=$(jq -r '.function.name' <<<"$call")
-      # arguments is normally a JSON *string*, but some backends send an object
-      cmd=$(jq -r '(.function.arguments
-                    | if type == "string" then fromjson? else . end
-                    | .command?) // empty' <<<"$call")
+      cmd=$(jq -r "$ARG"' | .command? // empty' <<<"$call")
       if (( INTERRUPTED )); then
+        sub_kill_all
         out="Skipped: the user interrupted."
+      elif [[ "$name" == explore ]] && (( SUBAGENTS )); then
+        if [[ -n "${SUB_PIDS[n]:-}" ]]; then
+          sub_collect "$n"
+          out="$TOOL_OUT"
+          sub_fill                        # a slot is free: start the next one
+        else
+          out='Error: invalid tool arguments; expected JSON like'
+          out+=' {"task": "..."}.'
+          printf '%s\n' "$out" >&2
+        fi
       elif [[ "$name" != "bash" ]]; then
-        out="Error: unknown tool '$name'. The only tool is 'bash'."
+        out="Error: unknown tool '$name'. The tools are: $TOOL_NAMES."
         printf '%s\n' "$out" >&2
       elif [[ -z "$cmd" ]]; then
         out='Error: invalid tool arguments; expected JSON like'
@@ -1038,7 +1689,36 @@ run_turn() {
 
     if (( INTERRUPTED )); then
       echo "(turn stopped — tell the agent what to do next)" >&2
+      TURN_OK=0
       return
+    fi
+    # A long turn can outgrow the context on tool output alone
+    auto_compact mid >&2
+    if (( INTERRUPTED )); then TURN_OK=0; return; fi
+
+    # Out of steps: one last request without tools, so the turn ends with an
+    # answer built on what was found instead of being cut off
+    steps=$((steps + 1))
+    if (( MAX_STEPS > 0 && steps >= MAX_STEPS )); then
+      append "$(jq -cn --arg n "$MAX_STEPS" '{role: "user", content:
+        ("You have used all \($n) tool steps of this turn. Do not call "
+         + "tools again: give your final answer now from what you found, "
+         + "and say what is still open.")}')"
+      if (( SUB )); then request "$MESSAGES" "quiet notools"
+      else request "$MESSAGES" notools; fi
+      if (( INTERRUPTED )); then abort_turn; TURN_OK=0; return; fi
+      result=$(assemble)
+      if ! msg=$(jq -ce '.message // empty | del(.tool_calls)' <<<"$result")
+      then
+        echo "API error: no final answer after the step limit." >&2
+        abort_turn; TURN_OK=0
+        return
+      fi
+      append "$msg"
+      if (( SUB )) || [[ "$(jq -r '.streamed' <<<"$result")" != true ]]; then
+        jq -r '.content // empty' <<<"$msg"
+      fi
+      return 0
     fi
   done
 }
@@ -1053,6 +1733,7 @@ if [[ -f "$AGENT_HISTFILE" ]] &&
     mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE" ||
     rm -f "$AGENT_HISTFILE.$$.tmp"
 fi
+[[ -f "$AGENT_HISTFILE" ]] && chmod 600 "$AGENT_HISTFILE" 2>/dev/null || true
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
 
 input="$FIRST_PROMPT"
@@ -1089,7 +1770,9 @@ while true; do
             if [[ -z "$arg" ]]; then
               list_sessions; echo "Usage: /resume <id or unique prefix>"
             else
-              load_session "$arg" || true
+              # The saved system message may be from the other mode or
+              # another directory: bring it in step, as startup does
+              if load_session "$arg"; then apply_mode "$MODE"; fi
             fi ;;
     /about) about ;;
     /model|"/model info") model_info ;;
@@ -1142,8 +1825,11 @@ while true; do
        run_turn ;;
   esac
   input=""
+  if (( ONESHOT )); then break; fi
 done
 
-[[ -f "$(session_file)" ]] &&
+(( ! SUB )) && [[ -f "$(session_file)" ]] &&
   echo "Session saved. Resume with: agent.sh -c  (or -r $SESSION_ID)" >&2
+# One-shot runs are used from scripts: a failed turn is a failed run
+if (( ONESHOT )) && (( ! TURN_OK )); then exit 1; fi
 exit 0
