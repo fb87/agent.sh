@@ -45,9 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or exit stops what they started, not just the shell.
 - A missing `jq` or `curl` is taken from the Nix store when possible; otherwise
   `agent.sh` says what to install and stops.
+- Commands that reach outside the workspace now need approval every time, also
+  under `-y`. The workspace is the git repository that contains the starting
+  directory (else that directory); common read-only system locations and
+  anything in `ALLOW_PATHS` are exempt. `OUTSIDE=allow` turns the question off
+  and `OUTSIDE=deny` refuses such commands. `WORKSPACE` sets the workspace.
+- Dangerous commands likewise need approval every time: a program in
+  `ASK_CMDS` in command position (`sudo`, `dd`, `reboot`, ...; `""` empties
+  the list), a forced push, a hard reset, `git clean -f`, or a download piped
+  into a shell. The prompt offers "always this session" for either kind.
+- `/about` shows the workspace and how commands outside it are treated.
 
 ### Changed
 
+- `-y` still runs ordinary commands without asking, but no longer approves a
+  command that reaches outside the workspace or looks dangerous; those are
+  asked about (or refused with `OUTSIDE=deny`).
 - Prompt overrides are now looked up per file in `$PROMPT_DIR` (if set), then
   `$XDG_CONFIG_HOME/agent.sh/prompts`, then `<install dir>/pro.mpts`, and
   finally the built-in prompt. The first non-blank file wins.

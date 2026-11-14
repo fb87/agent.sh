@@ -110,6 +110,10 @@ the rest.
 | `COMPACT_AT` | `100000` | history bytes that trigger it |
 | `TIMEOUT` | `300` | seconds of API silence before giving up |
 | `CMD_TIMEOUT` | `600` | seconds one command may run (`0` = no cap) |
+| `OUTSIDE` | `ask` | commands outside the workspace: `ask`, `allow` or `deny` |
+| `WORKSPACE` | git root, else `$PWD` | directory commands may use without a question |
+| `ALLOW_PATHS` | unset | extra directories that need no question, colon-separated |
+| `ASK_CMDS` | `sudo su doas pkexec dd …` | programs that always need approval (`""` = none) |
 | `MAX_STEPS` | `0` | tool rounds per turn (`0` = no limit) |
 | `PROJECT_DOC` | `1` | `0` stops `./AGENTS.md` joining the system prompt |
 | `SUBAGENTS` | `1` | `0` removes the `explore` tool |
@@ -175,11 +179,11 @@ are never overwritten.
 | `/plan` / `/build` | switch between read-only and editing modes |
 | `/exit` | quit (or Ctrl-D) |
 
-Flags: `-y` (no confirmation), `-p`/`--plan` and `-b`/`--build` (the last one
-wins), `-i` (stay in the REPL after a prompt), `-c`, `-r ID`, `-l [all]`,
-`-h`, `-V`. A prompt on the command line is answered and the agent exits; if
-the turn fails, the exit status is non-zero, so one-shot runs can be used from
-scripts. `--` ends option parsing.
+Flags: `-y` (run commands without asking, except the ones below), `-p`/`--plan`
+and `-b`/`--build` (the last one wins), `-i` (stay in the REPL after a prompt),
+`-c`, `-r ID`, `-l [all]`, `-h`, `-V`. A prompt on the command line is
+answered and the agent exits; if the turn fails, the exit status is non-zero,
+so one-shot runs can be used from scripts. `--` ends option parsing.
 
 Sessions are JSON files under `~/.local/state/agent.sh/sessions`; `-c`
 continues the latest in the current directory, `-r ID` resumes one, `-l [all]`
@@ -188,6 +192,27 @@ lists them. A fresh session (no `-c`/`-r`) starts with the `/about` card.
 A command is stopped after `CMD_TIMEOUT` seconds when `timeout` is available.
 Commands the model runs do not inherit the API key, and state files are
 created private.
+
+## Approval and the workspace
+
+The workspace is the git repository that contains the starting directory, or
+that directory when there is no repository. A command that names a path
+outside it (an absolute path, `~`, `$HOME`, or one that climbs with `..`)
+needs your approval every time, also under `-y`. Common read-only system
+locations (`/usr`, `/nix/store`, `/tmp`, ...) and anything in `ALLOW_PATHS`
+are exempt. `OUTSIDE=allow` turns the question off and `OUTSIDE=deny` refuses
+such commands instead.
+
+Dangerous commands are treated the same way: a program in `ASK_CMDS` in
+command position (`sudo`, `dd`, `reboot`, ...; `ASK_CMDS=""` empties the
+list), a forced push, a hard reset, `git clean -f`, or a download piped into
+a shell.
+
+The prompt offers `a` for "always this session", which allows either kind of
+command for the rest of the run; `OUTSIDE` and `ASK_CMDS` set up front do the
+same. This all reads the command text only, so it is a seat belt, not a
+sandbox: a script, a path built at run time or a symbolic link can still go
+elsewhere.
 
 ## Development
 

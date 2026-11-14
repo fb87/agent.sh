@@ -49,6 +49,13 @@
 # Ctrl-C stops the current reply or command without ending the session.
 # A command is stopped after CMD_TIMEOUT seconds (600; 0 = never) when the
 # "timeout" program is available.
+# A command that names a path outside the workspace (the git repository, or
+# else the starting directory) needs your approval every time, also under -y.
+# OUTSIDE=allow turns the question off and OUTSIDE=deny refuses such commands;
+# ALLOW_PATHS=/a:/b adds directories that need no question. So does a
+# dangerous command: a program in ASK_CMDS (sudo, dd, reboot, ...), a forced
+# push, a hard reset, a download piped into a shell. ASK_CMDS="" empties the
+# list. Both read the command text only: a seat belt, not a sandbox.
 # jq and curl are required. If one is missing and Nix is installed, it is used
 # from the Nix store (fetched if need be); otherwise agent.sh says what to
 # install and stops.
@@ -88,6 +95,12 @@ MAX_OUT="${MAX_OUT:-20000}"            # tool output bytes sent to the model
 AUTO_COMPACT="${AUTO_COMPACT:-1}"      # 1 = auto-summarize a long history
 COMPACT_AT="${COMPACT_AT:-100000}"     # history bytes that trigger that
 TIMEOUT="${TIMEOUT:-300}"              # seconds of silence before giving up
+OUTSIDE="${OUTSIDE:-ask}"              # outside the workspace: ask, allow, deny
+# Programs that always need approval, also under -y ("" = none)
+ASK_CMDS="${ASK_CMDS-sudo su doas pkexec dd mkfs fdisk parted shutdown reboot \
+poweroff halt systemctl nixos-rebuild crontab chown mount umount}"
+WORKSPACE="${WORKSPACE:-}"             # default: the git repository, else $PWD
+ALLOW_PATHS="${ALLOW_PATHS:-}"         # extra directories, colon-separated
 SUBAGENTS="${SUBAGENTS:-1}"            # 1 = offer the explore tool (sub-agents)
 SUB_MAX="${SUB_MAX:-4}"                # explorers running at the same time
 SUB_TIMEOUT="${SUB_TIMEOUT:-300}"      # seconds one explorer may take (0 = no cap)
@@ -456,6 +469,8 @@ about() {
   fi
   printf '  %-9s %s\n' prompts "$(prompt_notes)"
   printf '  %-9s %s\n' project "${PROJECT_DOC_USED:-no AGENTS.md here}"
+  printf '  %-9s %s (outside it: %s)\n' workspace "${WORKSPACE:-$PWD}" \
+    "$OUTSIDE"
   if (( SUBAGENTS )); then
     printf '  %-9s explore tool on, up to %s in parallel\n' explorers "$SUB_MAX"
   else
@@ -575,6 +590,10 @@ done
 [[ "$SUBAGENTS" == 0 || "$SUBAGENTS" == 1 ]] ||
   { echo "agent.sh: SUBAGENTS must be 0 or 1" >&2; exit 2; }
 (( SUB_MAX > 0 )) || SUB_MAX=1
+case "$OUTSIDE" in
+  ask|allow|deny) ;;
+  *) echo "agent.sh: OUTSIDE must be ask, allow or deny" >&2; exit 2 ;;
+esac
 case "$MODE" in
   build|plan) ;;
   *) echo "agent.sh: MODE must be 'build' or 'plan'" >&2; exit 2 ;;
@@ -702,6 +721,34 @@ if command -v setsid >/dev/null 2>&1 && setsid true >/dev/null 2>&1; then
   SETSID_BIN=setsid
 fi
 START_DIR="$PWD"
+# The workspace: where commands may work without a question. The repository
+# that contains the starting directory, if there is one, else that directory.
+if [[ -z "$WORKSPACE" ]]; then
+  WORKSPACE=$(git -C "$START_DIR" rev-parse --show-toplevel 2>/dev/null) ||
+    WORKSPACE=""
+  if [[ -z "$WORKSPACE" ]]; then
+    WORKSPACE="$START_DIR"               # not in a repository
+  else
+    case "$START_DIR/" in
+      "$WORKSPACE"/*) ;;
+      *) WORKSPACE="$START_DIR" ;;       # reached through a symbolic link
+    esac
+  fi
+fi
+WORKSPACE=${WORKSPACE%/}
+[[ -n "$WORKSPACE" ]] || WORKSPACE=/
+# System locations a normal user can read but not change, and scratch space:
+# naming these needs no question.
+OUTSIDE_ALLOW=(/usr /bin /sbin /lib /lib32 /lib64 /libexec /opt /etc
+               /nix/store /run/current-system /proc /sys /dev /tmp /var/tmp
+               /private/tmp)
+if [[ -n "${TMPDIR:-}" ]]; then OUTSIDE_ALLOW+=("${TMPDIR%/}"); fi
+if [[ -n "$ALLOW_PATHS" ]]; then
+  IFS=: read -ra dep <<<"$ALLOW_PATHS"
+  for pid in ${dep[@]+"${dep[@]}"}; do
+    if [[ "$pid" == /* ]]; then OUTSIDE_ALLOW+=("${pid%/}"); fi
+  done
+fi
 [[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] ||
   { echo "agent.sh: CMD_TIMEOUT must be a whole number of seconds" >&2; exit 2; }
 # Ctrl-C kills the foreground child (curl / the command) but not the agent
@@ -1249,6 +1296,8 @@ plan_allows() {
 
 # <<< plan guard
 
+RISK_OK=0                  # 1 = "always" was answered for dangerous commands
+
 # The text of file $1 for the model, in CLIPPED: at most MAX_OUT bytes, keeping
 # the head and the tail and saying what was cut
 clip_file() {
@@ -1265,6 +1314,116 @@ clip_file() {
     CLIPPED=$(tr -d '\0' <"$1")
   fi
 }
+
+# >>> outside check (tests/run.sh sources the lines between these two markers)
+PATH_RE='^[]A-Za-z0-9._/~+@%*?[$-]+$'   # what a path, not a pattern, is made of
+# NORM = the absolute path $1 with ".", ".." and "//" resolved by name only
+# (symbolic links are not followed)
+norm_path() {
+  local IFS=/ part i n=0
+  local -a in=() out=()
+  read -ra in <<<"$1"
+  for part in ${in[@]+"${in[@]}"}; do
+    case "$part" in
+      ""|.) ;;
+      ..) if (( n > 0 )); then n=$((n - 1)); fi ;;
+      *)  out[n]=$part; n=$((n + 1)) ;;
+    esac
+  done
+  NORM=""
+  for (( i = 0; i < n; i++ )); do NORM+="/${out[i]}"; done
+  [[ -n "$NORM" ]] || NORM=/
+}
+
+# Prints the places command $1 names that lie outside the workspace, one per
+# line. It reads the text of the
+# command: absolute paths, ~, $HOME and paths that climb with "..". It cannot
+# see what a script or program does on its own, a path built from other
+# variables, or where a symbolic link leads.
+outside_paths() {
+  local text="$1" w p first a seen=$'\n' hit
+  local -a words=()
+  text=${text//'${HOME}'/$HOME}
+  text=${text//'$HOME'/$HOME}
+  text=${text//'${PWD}'/$START_DIR}
+  text=${text//'$PWD'/$START_DIR}
+  # Words: split at blanks, quotes and shell punctuation
+  text=${text//[$'\n\t'\"\'\`\;\|\&\<\>\(\)=,:\{\}]/ }
+  read -ra words <<<"$text"
+  for w in ${words[@]+"${words[@]}"}; do
+    case "$w" in
+      -[A-Za-z]/) continue ;;             # awk -F/ : a separator, not a path
+      -[A-Za-z][/.~]*) w=${w:2} ;;        # -I/usr/include, -L../lib
+    esac
+    case "$w" in
+      /*)                  p=$w ;;
+      "~"|"~/"*)           p="$HOME${w:1}" ;;
+      ..|../*|*/..|*/../*) p="$START_DIR/$w" ;;
+      *) continue ;;
+    esac
+    # Not a path but a pattern or an expression (sed, grep, awk)
+    [[ "$p" =~ $PATH_RE ]] || continue
+    norm_path "$p"
+    p=$NORM
+    case "$p/" in "$WORKSPACE"/*|"$START_DIR"/*) continue ;; esac
+    if [[ "$WORKSPACE" == / ]]; then continue; fi
+    # "/api/v1" in a grep is not a file: an absolute path counts only if its
+    # first part exists (a wildcard there may match anything)
+    if [[ "$w" == /* && "$p" != / ]]; then
+      first=${p#/}; first="/${first%%/*}"
+      if [[ "$first" != *[*?[]* && ! -e "$first" ]]; then continue; fi
+    fi
+    hit=1
+    for a in "${OUTSIDE_ALLOW[@]}"; do
+      case "$p/" in "$a"/*) hit=""; break ;; esac
+    done
+    [[ -n "$hit" ]] || continue
+    if [[ "$seen" != *$'\n'"$p"$'\n'* ]]; then
+      seen+="$p"$'\n'; printf '%s\n' "$p"
+    fi
+  done
+}
+GIT_RE='[[:space:]]git[[:space:]]+([^[:space:]]+[[:space:]]+)*'
+GIT_PUSH_RE="${GIT_RE}push[[:space:]](.*[[:space:]])?"
+GIT_PUSH_RE+='(--force[^[:space:]]*|--mirror|--delete|-f)[[:space:]]'
+GIT_RESET_RE="${GIT_RE}reset[[:space:]](.*[[:space:]])?--hard"
+GIT_CLEAN_RE="${GIT_RE}clean[[:space:]](.*[[:space:]])?-[a-zA-Z]*f"
+# Prints what is dangerous about command $1, one finding per line: a program
+# from ASK_CMDS in command position (sudo, dd, reboot, ...), or one of a few
+# destructive forms (a forced push, a hard reset, piping a download into a
+# shell). Like outside_paths it reads the text only.
+risky_cmds() {
+  local text="$1" seg w seen=$'\n' found
+  local -a words=()
+  # One simple command per line: split at ; | & ( ) ` and newlines
+  text=${text//[\;\|\&\(\)\`]/$'\n'}
+  while IFS= read -r seg; do
+    read -ra words <<<"$seg"
+    found=""
+    for w in ${words[@]+"${words[@]}"}; do
+      case "$w" in
+        *=*|-*|[0-9]*|'{'|'!'|'$'|then|do|else|elif|if|while|until) continue ;;
+        env|command|exec|nohup|time|nice|ionice|stdbuf|timeout|xargs|watch)
+          continue ;;
+      esac
+      w=${w##*/}                          # /usr/bin/sudo
+      case " $ASK_CMDS " in *" $w "*) found="$w" ;; esac
+      break                               # only the word in command position
+    done
+    if [[ " $seg " =~ $GIT_PUSH_RE ]]; then
+      found="git push that rewrites or deletes"
+    elif [[ " $seg " =~ $GIT_RESET_RE ]]; then found="git reset --hard"
+    elif [[ " $seg " =~ $GIT_CLEAN_RE ]]; then found="git clean -f"
+    fi
+    if [[ -n "$found" && "$seen" != *$'\n'"$found"$'\n'* ]]; then
+      seen+="$found"$'\n'; printf '%s\n' "$found"
+    fi
+  done <<<"$text"
+  # A download run as a program: curl ... | sh
+  if [[ "$1" =~ (curl|wget)[^\;\&]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|da)?sh ]]
+  then printf 'download piped into a shell\n'; fi
+}
+# <<< outside check
 
 # True if $1 would signal processes by a name that matches the agent itself, or
 # every process of the user. These cannot be made harmless from the inside
@@ -1323,7 +1482,7 @@ run_tool() {
 
 run_tool_body() {
   local cmd="$1" ok="" rc=0 out note="" tpid i=0 left=""
-  local got_term=0 gone=""
+  local got_term=0 gone="" outside="" approved="" risky="" why
   local -a run=()
   if (( SUB )); then
     # One dim line per command; the parent's terminal is shared with others
@@ -1347,7 +1506,61 @@ run_tool_body() {
     printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
     return
   fi
-  if [[ "$AUTO" != 1 ]]; then
+  # Outside the workspace, or dangerous: ask every time, -y or not
+  if [[ "$OUTSIDE" != allow ]]; then
+    outside=$(outside_paths "$cmd" | head -n 8 | tr '\n' ' ')
+    outside=${outside% }
+  fi
+  if (( ! RISK_OK )); then
+    risky=$(risky_cmds "$cmd" | head -n 8 | tr '\n' ',')
+    risky=${risky%,}; risky=${risky//,/, }
+  fi
+  if [[ -n "$outside" || -n "$risky" ]]; then
+    why=""
+    if [[ -n "$outside" ]]; then
+      why="it reaches outside the workspace ($WORKSPACE): $outside"
+    fi
+    if [[ -n "$risky" ]]; then why+="${why:+; }it is dangerous: $risky"; fi
+    TOOL_OUT="Not run: $why."
+    if [[ -n "$outside" && "$OUTSIDE" == deny ]]; then
+      TOOL_OUT+=" Leaving the workspace is not allowed in this session; work"
+      TOOL_OUT+=" inside it."
+      printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+      return
+    fi
+    if ! { true </dev/tty; } 2>/dev/null; then
+      TOOL_OUT+=" It needs the user's approval and there is no terminal to"
+      TOOL_OUT+=" ask on. Find another way, or tell the user what you need"
+      TOOL_OUT+=" and why."
+      printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+      return
+    fi
+    printf '\033[35mNeeds your approval: %s\033[0m\n' "$why" >&2
+    read -rp "Allow it? [y/N/a=always this session, or say why not] " ok \
+      </dev/tty || ok=""
+    case "$ok" in
+      [Yy]|[Yy][Ee][Ss]) approved=1 ;;
+      [Aa]|[Aa]lways)
+        approved=1
+        if [[ -n "$outside" ]]; then
+          OUTSIDE=allow
+          echo "Commands may now leave the workspace without asking." >&2
+        fi
+        if [[ -n "$risky" ]]; then
+          RISK_OK=1
+          echo "Dangerous commands now run without this question." >&2
+        fi ;;
+      ""|[Nn]|[Nn][Oo])
+        TOOL_OUT+=" The user did not allow it."
+        printf '%s\n' "$TOOL_OUT" >&2
+        return ;;
+      *)
+        TOOL_OUT+=" The user did not allow it and said: $ok"
+        printf '%s\n' "$TOOL_OUT" >&2
+        return ;;
+    esac
+  fi
+  if [[ "$AUTO" != 1 && -z "$approved" ]]; then
     if ! { true </dev/tty; } 2>/dev/null; then   # nothing to ask the user on
       TOOL_OUT="The user declined to run this command (no terminal to ask"
       TOOL_OUT+=" on; run with -y to approve commands up front)."
@@ -1508,6 +1721,7 @@ sub_start() {
     export AGENT_SUB=1 AGENT_SUB_NAME="explorer $n" AGENT_API_KEY="$API_KEY"
     export MODEL PROVIDER URL REASONING THINKING TEMPERATURE MAX_OUT TIMEOUT
     export CMD_TIMEOUT SUB_MAX_STEPS PROJECT_DOC AUTO_COMPACT COMPACT_AT
+    export OUTSIDE WORKSPACE ALLOW_PATHS ASK_CMDS
     export SESSION_DIR="$SUB_DIR/sessions" AGENT_HISTFILE=/dev/null
     export SHOW_REASONING=0
     if [[ -n "$PROMPT_DIR" ]]; then export PROMPT_DIR; fi
