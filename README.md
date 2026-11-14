@@ -124,6 +124,10 @@ the rest.
 | `AGENT_HISTFILE` | `~/.agent_sh_history` | readline history file |
 | `AGENT_HISTORY_MAX` | `1000` | lines kept in that file |
 | `PROMPT_DIR` | unset | explicit prompt directory |
+| `PROMPT_PATH_MAX` | `32` | width of the directory shown (long paths are cut from the left) |
+| `PROMPT_GIT` | `1` | `0` hides the git branch (`*` = uncommitted changes) |
+| `PROMPT_MODEL` | `0` | `1` adds the model to the prompt |
+| `PROMPT_CONTEXT` | `1` | `0` hides the history size against `COMPACT_AT` |
 | `AGENT_CONFIG` | `$XDG_CONFIG_HOME/agent.sh/config.json` | user config file |
 | `AGENT_CONFIG_DIR` | `$XDG_CONFIG_HOME/agent.sh` | config directory |
 | `AGENT_SYSTEM_CONFIG` | `/etc/agent.sh/config.json` | system config file |

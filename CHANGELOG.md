@@ -60,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The REPL prompt shows the mode, the directory, the git branch (`*` for
+  uncommitted changes), the history size against `COMPACT_AT` and `auto`
+  when commands run without asking, and only 8 characters of the session
+  id. `PROMPT_PATH_MAX`, `PROMPT_GIT`, `PROMPT_MODEL` and
+  `PROMPT_CONTEXT` control it; `/about` shows the full id.
+
 - `-y` still runs ordinary commands without asking, but no longer approves a
   command that reaches outside the workspace or looks dangerous; those are
   asked about (or refused with `OUTSIDE=deny`).

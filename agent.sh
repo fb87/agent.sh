@@ -46,6 +46,11 @@
 # On the first run the config directory is created and the bundled prompts are
 # copied into it as NAME.md.example; rename one to NAME.md to override that
 # prompt. A fresh session also prints /about.
+# The REPL prompt shows the mode, the directory, the git branch ("*" means
+# uncommitted changes), the history size against COMPACT_AT and "auto" when
+# commands run without asking. PROMPT_PATH_MAX (32) caps the directory,
+# PROMPT_GIT=0 and PROMPT_CONTEXT=0 hide those, PROMPT_MODEL=1 adds the
+# model; /about shows the full session id.
 # Ctrl-C stops the current reply or command without ending the session.
 # A command is stopped after CMD_TIMEOUT seconds (600; 0 = never) when the
 # "timeout" program is available.
@@ -113,6 +118,15 @@ unset AGENT_SUB AGENT_SUB_NAME
 PROJECT_DOC="${PROJECT_DOC:-1}"        # 1 = add ./AGENTS.md to the system prompt
 CMD_TIMEOUT="${CMD_TIMEOUT:-600}"      # seconds one command may run (0 = no cap)
 SHOW_REASONING="${SHOW_REASONING:-1}"  # 1 = stream reasoning (dimmed)
+PROMPT_PATH_MAX="${PROMPT_PATH_MAX:-32}"  # width of the directory in prompt
+PROMPT_GIT="${PROMPT_GIT:-1}"          # 1 = show the git branch
+PROMPT_MODEL="${PROMPT_MODEL:-0}"      # 1 = show the model too
+PROMPT_CONTEXT="${PROMPT_CONTEXT:-1}"  # 1 = show history size / COMPACT_AT
+# A non-numeric setting falls back to its default instead of breaking (( )).
+[[ "$PROMPT_PATH_MAX" =~ ^[0-9]+$ ]] || PROMPT_PATH_MAX=32
+[[ "$PROMPT_GIT" =~ ^[0-9]+$ ]] || PROMPT_GIT=1
+[[ "$PROMPT_MODEL" =~ ^[0-9]+$ ]] || PROMPT_MODEL=0
+[[ "$PROMPT_CONTEXT" =~ ^[0-9]+$ ]] || PROMPT_CONTEXT=1
 AGENT_HISTFILE="${AGENT_HISTFILE:-$HOME/.agent_sh_history}"
 AGENT_HISTORY_MAX="${AGENT_HISTORY_MAX:-1000}"   # lines kept in that file
 SESSION_DIR="${SESSION_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}\
@@ -455,6 +469,7 @@ about() {
     "${TEMPERATURE:-default}"
   printf '  %-9s %s\n' endpoint "$URL"
   printf '  %-9s set (%s)\n' api-key "${API_KEY_SOURCE:-unknown}"
+  printf '  %-9s %s\n' session "$SESSION_ID"
   printf '  %-9s %s\n' sessions "$SESSION_DIR"
   printf '  %-9s %s\n' auto "$run"
   if [[ "$MODE" == plan ]]; then
@@ -1939,6 +1954,62 @@ run_turn() {
 
 # ---------------------------------------------------------------- REPL
 
+# ---- prompt ---------------------------------------------------------------
+# One line, ASCII only. ~ stands for $HOME, and the directory is cut from the
+# left when longer than PROMPT_PATH_MAX. The colour codes are wrapped in
+# \001 \002 so readline counts them as zero width.
+short_path() {
+  local p=$1 home=${HOME%/} max=$PROMPT_PATH_MAX
+  if [[ -n "$home" && "$p" == "$home"* ]]; then p="~${p#"$home"}"; fi
+  (( max >= 4 )) || max=4
+  (( ${#p} <= max )) || p="...${p: -$((max - 3))}"
+  printf '%s' "$p"
+}
+
+# "branch" or "branch*" when anything is uncommitted. A single git call gets
+# the branch and the changes together; empty outside a repository.
+git_badge() {
+  (( PROMPT_GIT )) || return 0
+  local out line b="" dirty=""
+  out=$(git -C "$PWD" status --porcelain=v2 --branch 2>/dev/null) || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "# branch.head "*) b=${line#"# branch.head "} ;;
+      "#"*|"") ;;
+      *) dirty="*"; break ;;
+    esac
+  done <<<"$out"
+  if [[ "$b" == "(detached)" ]]; then b=detached; fi
+  printf '%s' "$b$dirty"
+}
+
+# History bytes against COMPACT_AT, in kB; the threshold is omitted when
+# automatic compaction is off.
+context_badge() {
+  (( PROMPT_CONTEXT )) || return 0
+  local msgs=${MESSAGES:-} n lim
+  n=$(( ${#msgs} / 1024 )); lim=$(( COMPACT_AT / 1024 ))
+  if (( AUTO_COMPACT && lim > n )); then printf '%sk/%sk' "$n" "$lim"
+  else printf '%sk' "$n"; fi
+}
+
+build_prompt_text() {
+  local r=$'\001\033[0m\002' s b
+  local grn=$'\001\033[32m\002' mag=$'\001\033[35m\002'
+  local blu=$'\001\033[34m\002' yel=$'\001\033[33m\002'
+  local cyn=$'\001\033[36m\002' dim=$'\001\033[2m\002'
+  if [[ "$MODE" == plan ]]; then s=$mag"plan$r"; else s=$grn"build$r"; fi
+  s+=" $blu$(short_path "$PWD")$r"
+  b=$(git_badge)
+  if [[ -n "$b" ]]; then s+=" $yel$b$r"; fi
+  if (( PROMPT_MODEL )); then s+=" $dim$MODEL$r"; fi
+  b=$(context_badge)
+  if [[ -n "$b" ]]; then s+=" $dim$b$r"; fi
+  if (( AUTO )); then s+=" $yel"auto"$r"; fi
+  s+=" $cyn${SESSION_ID:0:8}$r\$"
+  printf '\n%s ' "$s"
+}
+
 # Readline history across runs, trimmed so the file cannot grow without bound
 if [[ -f "$AGENT_HISTFILE" ]] &&
    (( $(wc -l <"$AGENT_HISTFILE" 2>/dev/null || echo 0) \
@@ -1959,12 +2030,7 @@ while true; do
     # line).
     # The fork inherits the history list, so Up arrow still works.
     # \001 \002 mark the color codes as zero-width for readline
-    if [[ "$MODE" == plan ]]; then
-      prompt_text=$'\n\001\033[35m\002plan\001\033[0m\002 '
-    else
-      prompt_text=$'\n'
-    fi
-    prompt_text+=$'\001\033[36m\002'"$SESSION_ID"$'$\001\033[0m\002 '
+    prompt_text=$(build_prompt_text)
     input=$(trap - INT
             IFS= read -erp "$prompt_text" line &&
             printf '%s' "$line") || rc=$?
