@@ -129,7 +129,7 @@ API_KEY=""                             # set by load_settings
 API_KEY_SOURCE=""
 CONFIG_LOADED=0
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
