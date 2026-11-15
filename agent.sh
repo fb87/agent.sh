@@ -25,7 +25,8 @@
 # /model shows the model, reasoning effort, thinking and temperature;
 # /model set temperature 0.1 (or reasoning medium, thinking off) changes one
 # for this run, as do the MODEL, REASONING, THINKING and TEMPERATURE
-# environment variables.
+# environment variables. /model list prints the models the endpoint offers
+# and /model use picks one by number or name.
 # There are two modes. Build (the default) edits files and runs commands.
 # Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
@@ -201,6 +202,13 @@ provider_url() {
       printf '%s' 'https://opencode.ai/zen/go/v1/chat/completions' ;;
     *) return 1 ;;
   esac
+}
+
+# The endpoint that lists the models, derived from the chat endpoint
+models_url() {
+  local u="${URL%/}"
+  u="${u%/chat/completions}"
+  printf '%s/models' "$u"
 }
 
 # One top-level string/number/boolean field of a JSON config; empty if absent.
@@ -560,6 +568,80 @@ set_model() {
     thinking)    printf 'thinking = %s\n' "${THINKING:-server default}" ;;
     temperature) printf 'temperature = %s\n' "${TEMPERATURE:-server default}" ;;
   esac
+}
+
+# Fetches the endpoint's model list into $TMP/models, one id per line.
+# Explains a failure and returns non-zero; the current model is untouched.
+fetch_models() {
+  local url code
+  ensure_tmp
+  url=$(models_url)
+  : >"$TMP/models"   # never resolve /model use against a stale list
+  code=$(curl -sS --connect-timeout 30 --max-time "$TIMEOUT" \
+    -D "$TMP/models.hdr" -o "$TMP/models.json" \
+    -H @"$TMP/auth" -H "Accept: application/json" "${url}" 2>"$TMP/curl.err" \
+    && awk '/^HTTP\//{c = $2} END{print c}' "$TMP/models.hdr") || code=""
+  if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+    printf 'agent.sh: cannot list models from %s%s\n' "$url" \
+      "${code:+ (HTTP $code)}" >&2
+    [[ -s "$TMP/curl.err" ]] && sed 's/^/  /' "$TMP/curl.err" >&2
+    return 1
+  fi
+  if ! jq -r '(.data // .models // [])[]
+               | (.id // .name // empty)' "$TMP/models.json" \
+       >"$TMP/models" 2>/dev/null || [[ ! -s "$TMP/models" ]]; then
+    printf 'agent.sh: %s returned no model list\n' "$url" >&2
+    return 1
+  fi
+}
+
+# /model list: the models the endpoint offers, the current one marked
+model_list() {
+  local n=0 id
+  if ! fetch_models; then return 0; fi
+  printf 'Models at %s:\n' "$(models_url)"
+  while IFS= read -r id; do
+    n=$((n + 1))
+    if [[ "$id" == "$MODEL" ]]; then
+      printf '  \033[1m%2d  %s  *\033[0m\n' "$n" "$id"
+    else
+      printf '  %2d  %s\n' "$n" "$id"
+    fi
+  done <"$TMP/models"
+  echo "Switch with: /model use <number or name>"
+}
+
+# /model use <number or name>: switches the model for this run
+model_use() {
+  local want="${1:-}" pick="" n=0 id
+  if [[ -z "$want" ]]; then
+    echo "Usage: /model use <number or name> (list them: /model list)"
+    return 0
+  fi
+  [[ -s "$TMP/models" ]] || fetch_models || return 0
+  if [[ "$want" =~ ^[0-9]+$ ]]; then
+    while IFS= read -r id; do
+      n=$((n + 1))
+      if (( n == want )); then pick="$id"; break; fi
+    done <"$TMP/models"
+    if [[ -z "$pick" ]]; then
+      printf 'No model number %s (the list has %s; see: /model list)\n' \
+        "$want" "$n"
+      return 0
+    fi
+  else
+    pick="$want"
+    if ! grep -Fxq -- "$pick" "$TMP/models"; then
+      printf '%s\n' \
+        "warning: $pick is not in the list; sending it anyway" >&2
+    fi
+  fi
+  MODEL="$pick"
+  printf 'model = %s\n' "$MODEL"
+  if (( CONTEXT > 0 )); then
+    printf '(COMPACT_AT stays at %s bytes; set CONTEXT for the new model)\n' \
+      "$COMPACT_AT"
+  fi
 }
 
 # Version and environment details (REPL: /about, CLI: -V or --version)
@@ -2785,10 +2867,19 @@ while true; do
             fi ;;
     /about) about ;;
     /model|"/model info") model_info ;;
+    "/model list") model_list ;;
+    "/model use"|"/model use "*)
+            read -r arg rest _ <<<"${input#/model use}" || true
+            if [[ -n "$rest" ]]; then
+              echo "Usage: /model use <number or name>"
+            else
+              model_use "${arg:-}"
+            fi ;;
     "/model set"|"/model set "*)
             read -r key val rest _ <<<"${input#/model set}" || true
             set_model "${key:-}" "${val:-}" "${rest:-}" ;;
-    "/model "*) echo "Usage: /model [info] | /model set <key> <value>" ;;
+    "/model "*) echo "Usage: /model [info|list] | /model use <number or"\
+                      "name> | /model set <key> <value>" ;;
     /compact) compact || true ;;
     /reset) SESSION_ID=$(new_id); new_history
             echo "New session $SESSION_ID." ;;
@@ -2810,6 +2901,9 @@ while true; do
               echo "Build mode: commands run and files can change."
             fi ;;
     /help)  echo "/about           version, author, model and session details"
+            echo "/model list      list the endpoint's models (current one"\
+                 "marked)"
+            echo "/model use ID    switch by number or name for this run"
             echo "/model           model settings: name, reasoning,"\
                  "thinking, temperature"
             echo "                 (/model set temperature 0.1, /model"\

@@ -175,7 +175,10 @@ are never overwritten.
 | Command | Purpose |
 | --- | --- |
 | `/about` | version, config, provider/model, endpoint, prompts, sessions |
-| `/model` | show model settings; `/model set <key> <value>` changes one |
+| `/model` | show model settings |
+| `/model list` | list the models the endpoint offers (current one marked) |
+| `/model use <id>` | switch model by number or name, for this run |
+| `/model set <key> <value>` | change one setting (and only for this run) |
 | `/compact` | summarize the history (also automatic past `COMPACT_AT`) |
 | `/sessions [all]` | list saved sessions |
 | `/resume ID` | switch to a session by id or unique prefix |

@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses one hardcoded byte threshold for every model. Without `CONTEXT` the
   old `100000`-byte threshold stays; a `COMPACT_AT` past the window produces
   a warning, and `/model` shows the window and the threshold.
+- `/model list` and `/model use <number or name>`: the REPL asks the
+  endpoint's `/models` (derived from `URL`) for the models it offers, marks
+  the current one and switches to another for this run. A number must be in
+  the list; a name that is not is sent anyway with a warning, so private or
+  alias names keep working. Failures (bad key, no network, no list) are
+  reported and leave the current model alone.
 - `nix flake check` now runs `shellcheck` on `agent.sh`, so linting (and the
   quoting, `eval` and word-splitting findings behind most script security
   bugs) is part of the check instead of an optional local habit.
