@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # vim: set ts=2 sw=2 sts=2 et ai tw=80 cc=80 ft=sh :
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329
+# (jq programs are single-quoted on purpose; tools are called as "tool_$name")
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
 # Usage: agent.sh [-y] [-p | -b] [-i] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
@@ -285,6 +287,13 @@ load_settings() {
       exit 2
     fi
   fi
+  # The API key travels in a header: say so if nothing encrypts it on the way
+  case "$URL" in
+    https://*|http://localhost[:/]*|http://127.0.0.1[:/]*|http://\[::1\]*) ;;
+    *) printf 'agent.sh: warning: %s is not https; the API key and the' \
+         "$URL" >&2
+       printf ' conversation are sent unencrypted\n' >&2 ;;
+  esac
   case "$REASONING" in
     minimal|low|medium|high|"") ;;
     *) printf '%s\n' \
@@ -475,7 +484,7 @@ list_sessions() {
   return 0
 }
 
-usage() { sed -n '4,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
+usage() { sed -n '6,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
 
 # The current model settings (REPL: /model or /model info)
 model_info() {
@@ -698,14 +707,20 @@ else
   SUB=0
 fi
 for dep in SUB_MAX SUB_TIMEOUT SUB_MAX_STEPS MAX_STEPS; do
-  [[ "${!dep}" =~ ^[0-9]+$ ]] ||
+  [[ "${!dep}" =~ ^(0|[1-9][0-9]*)$ ]] ||
     { echo "agent.sh: $dep must be a whole number" >&2; exit 2; }
+done
+# These are used in (( )): anything but 0 or 1 would be read as a variable name
+for dep in AUTO AUTO_COMPACT SHOW_REASONING PROJECT_DOC; do
+  [[ "${!dep}" == 0 || "${!dep}" == 1 ]] ||
+    { echo "agent.sh: $dep must be 0 or 1" >&2; exit 2; }
 done
 [[ "$SUBAGENTS" == 0 || "$SUBAGENTS" == 1 ]] ||
   { echo "agent.sh: SUBAGENTS must be 0 or 1" >&2; exit 2; }
 [[ "$WEB" == 0 || "$WEB" == 1 ]] ||
   { echo "agent.sh: WEB must be 0 or 1" >&2; exit 2; }
-for dep in WEB_TIMEOUT READ_LINES; do
+for dep in WEB_TIMEOUT READ_LINES MAX_OUT COMPACT_AT TIMEOUT \
+           AGENT_HISTORY_MAX; do
   [[ "${!dep}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "agent.sh: $dep must be a whole number above 0" >&2; exit 2; }
 done
@@ -927,7 +942,7 @@ SETSID_BIN=""
 if command -v setsid >/dev/null 2>&1 && setsid true >/dev/null 2>&1; then
   SETSID_BIN=setsid
 fi
-[[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] ||
+[[ "$CMD_TIMEOUT" =~ ^(0|[1-9][0-9]*)$ ]] ||
   { echo "agent.sh: CMD_TIMEOUT must be a whole number of seconds" >&2; exit 2; }
 # Ctrl-C kills the foreground child (curl / the command) but not the agent
 INTERRUPTED=0
@@ -1049,6 +1064,10 @@ if [[ -n "$RESUME" ]]; then
   load_session "$RESUME" || exit 1
 else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
+  # It becomes a file name and a request header
+  [[ "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    { echo "agent.sh: SESSION_ID may only hold letters, digits and ._-" >&2
+      exit 2; }
   new_history
   (( SUB )) || about                     # banner on a fresh start
 fi
@@ -1162,8 +1181,9 @@ http_post() {
 
 # Sends $1 (a messages array), leaves the raw stream in $TMP/sse. $2 is a list
 # of flags: "quiet" keeps the reply off the screen, otherwise it is streamed as
-# it arrives; "notools" sends no tool definitions, so the reply is text. Retries only when nothing arrived or the server asks to retry, never
-# after part of a reply was already shown.
+# it arrives; "notools" sends no tool definitions, so the reply is text.
+# Retries only when nothing arrived or the server asks to retry, never after
+# part of a reply was already shown.
 request() {
   local msgs="$1" flags=" ${2:-} " attempt code body notools=0
   ensure_tmp
@@ -1370,10 +1390,11 @@ plan_split() {
 plan_git_ok() {
   local a sub="" list=0
   # -c / --config-env can define aliases and pagers that run commands; the
-  # others write a file or start a program
+  # others write a file or start a program. Some subcommands accept a long
+  # option cut short (--open for --open-files-in-pager), hence the prefixes.
   for a; do
     case "$a" in
-      -c|--config-env*|--output*|-O*|--open-files-in-pager*|--ext-diff)
+      -c|--config-env*|--output*|-O*|--op*|--ext-diff|--exec*|--upload-pack*)
         return 1 ;;
     esac
   done
@@ -1385,7 +1406,7 @@ plan_git_ok() {
     esac
   done
   case "$sub" in
-    status|diff|log|show|blame|ls-files|ls-tree|ls-remote|rev-parse|grep|\
+    status|diff|log|show|blame|ls-files|ls-tree|rev-parse|grep|\
     cat-file|show-ref|shortlog|describe|for-each-ref)
       return 0 ;;
     branch|tag)
@@ -1439,14 +1460,17 @@ plan_simple_ok() {
             esac
           done ;;
     sort|tree)                          # -o FILE, -oFILE, -uo FILE, --output
-          for a; do
-            case "$a" in --o*|-[!-]*o*|-o*) return 1 ;; esac
+          for a; do                     # and sort --compress-program=PROG
+            case "$a" in --o*|-[!-]*o*|-o*|--co*) return 1 ;; esac
+          done ;;
+    file) for a; do                     # -C writes a compiled magic file
+            case "$a" in -C*|-[!-]*C*|--comp*) return 1 ;; esac
           done ;;
     date) for a; do
             case "$a" in -s*|--s*) return 1 ;; esac
           done ;;
     rg)   for a; do
-            case "$a" in --pre*) return 1 ;; esac
+            case "$a" in --pre*|--hostname-bin*) return 1 ;; esac
           done ;;
   esac
   for c in "${PLAN_CMDS[@]}"; do
@@ -1496,7 +1520,8 @@ gate() {
     printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
     return 1
   fi
-  if ! { true </dev/tty; } 2>/dev/null; then
+  # An explorer never asks: several run at once and share the terminal
+  if (( SUB )) || ! { true </dev/tty; } 2>/dev/null; then
     TOOL_OUT+=" It needs the user's approval and there is no terminal to"
     TOOL_OUT+=" ask on. Find another way, or tell the user what you need"
     TOOL_OUT+=" and why."
@@ -1557,6 +1582,23 @@ confirm() {
   return 1
 }
 
+# VIS = $1 as it is safe to show: the text comes from the model, and a control
+# character in it (ESC, CR, backspace) could move the cursor and hide what the
+# user is asked to approve. ESC and CR are spelled out, the others become "?".
+# Newlines and tabs stay.
+visible() {
+  local LC_ALL=C
+  VIS=$1
+  [[ "$VIS" == *[$'\001'-$'\010'$'\013'-$'\037'$'\177'$'\302']* ]] || return 0
+  VIS=${VIS//$'\033'/'\e'}
+  VIS=${VIS//$'\r'/'\r'}
+  VIS=${VIS//$'\302'[$'\200'-$'\237']/'?'}            # C1 controls in UTF-8
+  VIS=${VIS//[$'\001'-$'\010'$'\013'-$'\037'$'\177']/'?'}
+}
+
+# The same for a stream: drops control characters except newline and tab
+strip_controls() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
+
 # The text of file $1 for the model, in CLIPPED: at most MAX_OUT bytes, keeping
 # the head and the tail and saying what was cut
 clip_file() {
@@ -1595,10 +1637,9 @@ norm_path() {
 }
 
 # Prints the places command $1 names that lie outside the workspace, one per
-# line. It reads the text of the
-# command: absolute paths, ~, $HOME and paths that climb with "..". It cannot
-# see what a script or program does on its own, a path built from other
-# variables, or where a symbolic link leads.
+# line. It reads the text of the command: absolute paths, ~, $HOME and paths
+# that climb with "..". It cannot see what a script or program does on its
+# own, a path built from other variables, or where a symbolic link leads.
 outside_paths() {
   local text="$1" w p first a seen=$'\n' hit
   local -a words=()
@@ -1614,6 +1655,7 @@ outside_paths() {
       -[A-Za-z]/) continue ;;             # awk -F/ : a separator, not a path
       -[A-Za-z][/.~]*) w=${w:2} ;;        # -I/usr/include, -L../lib
     esac
+    # shellcheck disable=SC2088  # a literal ~ in the command text
     case "$w" in
       /*)                  p=$w ;;
       "~"|"~/"*)           p="$HOME${w:1}" ;;
@@ -1738,8 +1780,8 @@ stop_group() {
 # - behind a wrapper shell, so its $PPID is that wrapper and not the agent;
 # - with SIGTERM to the agent held off while it runs (and reported);
 # - with our scratch files and working directory put back if it removed them.
-# Ctrl-C and the timeout end the whole group, background jobs included. (no subshell, so Ctrl-C state
-# survives)
+# Ctrl-C and the timeout end the whole group, background jobs included.
+# (No subshell, so Ctrl-C state survives.)
 run_tool() {
   # fd 9 is where the command and the notes about it are shown: our stderr, or
   # nowhere for an explorer. (A dup, not a path: opening /dev/stderr again
@@ -1754,11 +1796,12 @@ run_tool_body() {
   local cmd="$1" ok="" rc=0 out note="" tpid i=0 left=""
   local got_term=0 gone="" outside="" risky=""
   local -a run=()
+  visible "$cmd"
   if (( SUB )); then
     # One dim line per command; the parent's terminal is shared with others
-    printf '\033[2m[%s] $ %s\033[0m\n' "$SUB_NAME" "${cmd%%$'\n'*}" >&2
+    printf '\033[2m[%s] $ %s\033[0m\n' "$SUB_NAME" "${VIS%%$'\n'*}" >&2
   else
-    printf '\n\033[33m$ %s\033[0m\n' "$cmd" >&2
+    printf '\n\033[33m$ %s\033[0m\n' "$VIS" >&2
   fi
   if [[ "$MODE" == plan ]] && ! plan_allows "$cmd"; then
     TOOL_OUT="Plan mode: command not run. Only read-only inspection"
@@ -1903,6 +1946,7 @@ run_tool_body() {
 # FILE_OUTSIDE = that path if using it needs the gate, else empty.
 file_target() {
   local p="$1" phys
+  # shellcheck disable=SC2088  # a literal ~ in the tool argument
   case "$p" in
     "~"|"~/"*) p="$HOME${p:1}" ;;
     /*) ;;
@@ -1921,7 +1965,11 @@ file_target() {
     FILE_OUTSIDE="$FILE_PATH (a symbolic link)"
     return 0
   fi
-  phys=$(cd -P "${FILE_PATH%/*}/" 2>/dev/null && pwd -P) || phys=""
+  # The nearest directory that exists: write creates the missing ones below
+  # it, so a link further up must not be overlooked
+  phys=${FILE_PATH%/*}
+  while [[ -n "$phys" && ! -d "$phys" ]]; do phys=${phys%/*}; done
+  phys=$(cd -P "${phys:-/}" 2>/dev/null && pwd -P) || phys=""
   if [[ -n "$phys" && -n "$WORKSPACE_PHYS" ]] && ! path_is_free "$phys"; then
     case "$phys/" in
       "$WORKSPACE_PHYS"/*) ;;
@@ -1941,14 +1989,15 @@ is_binary() {
 
 # One line on the terminal saying what a file or web tool is about to do
 tool_line() {
-  if (( SUB )); then printf '\033[2m[%s] %s\033[0m\n' "$SUB_NAME" "$1" >&2
-  else printf '\n\033[33m%s\033[0m\n' "$1" >&2; fi
+  visible "$1"
+  if (( SUB )); then printf '\033[2m[%s] %s\033[0m\n' "$SUB_NAME" "$VIS" >&2
+  else printf '\n\033[33m%s\033[0m\n' "$VIS" >&2; fi
 }
 
 # Shows how file $1 would change into file $2 (at most 80 lines)
 show_diff() {
   command -v diff >/dev/null 2>&1 || return 0
-  diff -u "$1" "$2" 2>/dev/null | tail -n +3 | head -n 80 |
+  diff -u "$1" "$2" 2>/dev/null | tail -n +3 | head -n 80 | strip_controls |
     sed -e $'s/^+.*/\033[32m&\033[0m/' -e $'s/^-.*/\033[31m&\033[0m/' >&2 ||
     true
 }
@@ -1967,7 +2016,8 @@ tool_read() {
     return 0
   fi
   file_target "$path"
-  tool_line "read $path${1:+ (from line $off)}"
+  if (( off > 1 )); then tool_line "read $path (from line $off)"
+  else tool_line "read $path"; fi
   gate "$FILE_OUTSIDE" "" || return 0
   if [[ -d "$FILE_PATH" ]]; then
     TOOL_OUT="Error: $path is a directory. List it with bash: ls -la $path"
@@ -2052,7 +2102,8 @@ tool_write() {
     if [[ -f "$FILE_PATH" ]] && ! is_binary "$FILE_PATH"; then
       show_diff "$FILE_PATH" "$TMP/arg.content"
     else
-      head -n 20 "$TMP/arg.content" | sed $'s/^.*$/\033[32m+&\033[0m/' >&2
+      head -n 20 "$TMP/arg.content" | strip_controls |
+        sed $'s/^.*$/\033[32m+&\033[0m/' >&2
       if (( lines > 20 )); then printf '  ... %s more lines\n' $((lines - 20)) >&2
       fi
     fi
@@ -2648,7 +2699,7 @@ build_prompt_text() {
   if (( PROMPT_MODEL )); then s+=" $dim$MODEL$r"; fi
   b=$(context_badge)
   if [[ -n "$b" ]]; then s+=" $dim$b$r"; fi
-  if (( AUTO )); then s+=" $yel"auto"$r"; fi
+  if (( AUTO )); then s+=" ${yel}auto$r"; fi
   s+=" $cyn${SESSION_ID:0:8}$r\$"
   printf '\n%s ' "$s"
 }
@@ -2657,9 +2708,11 @@ build_prompt_text() {
 if [[ -f "$AGENT_HISTFILE" ]] &&
    (( $(wc -l <"$AGENT_HISTFILE" 2>/dev/null || echo 0) \
         > AGENT_HISTORY_MAX )); then
-  tail -n "$AGENT_HISTORY_MAX" "$AGENT_HISTFILE" >"$AGENT_HISTFILE.$$.tmp" &&
-    mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE" ||
+  if ! { tail -n "$AGENT_HISTORY_MAX" "$AGENT_HISTFILE" \
+           >"$AGENT_HISTFILE.$$.tmp" &&
+         mv -f "$AGENT_HISTFILE.$$.tmp" "$AGENT_HISTFILE"; } 2>/dev/null; then
     rm -f "$AGENT_HISTFILE.$$.tmp"
+  fi
 fi
 [[ -f "$AGENT_HISTFILE" ]] && chmod 600 "$AGENT_HISTFILE" 2>/dev/null || true
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
