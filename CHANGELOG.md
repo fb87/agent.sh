@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-15
+
 ### Added
 
+- File tools: `read` (numbered lines, at most `READ_LINES`), `edit` and
+  `write`. Reading inside the workspace needs no approval; edit and write
+  show the change and ask, refuse binary files, and create missing
+  directories. All three stop at the workspace like commands do.
+- Web tools: `web_search` (Brave with `BRAVE_API_KEY`, Tavily with
+  `TAVILY_API_KEY` or a SearXNG server with `SEARXNG_URL` when one is set,
+  else DuckDuckGo's HTML page) and `web_fetch`, which turns a page into text.
+  `WEB=0` removes both, and the keys can also be set in the config file.
+- Prompt commands: `commands/NAME.md` in a prompt directory becomes `/NAME`
+  in the REPL; the first line may be an HTML comment describing it for
+  `/help`, `{{args}}` takes the text typed after the name, and without it
+  that text is appended. Prompts may use `{{cwd}}`, `{{workspace}}`, `{{os}}`
+  and `{{date}}`.
 - `CONTEXT` (tokens) for the model's context window. When it is set,
   `COMPACT_AT` defaults to half of the window, counting 4 bytes per token
   (e.g. `CONTEXT=128000` compacts at 256000 bytes), so compaction no longer
@@ -24,6 +39,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nix flake check` now runs `shellcheck` on `agent.sh`, so linting (and the
   quoting, `eval` and word-splitting findings behind most script security
   bugs) is part of the check instead of an optional local habit.
+
+### Changed
+
+- A warning is printed when the API endpoint is not `https` and not
+  localhost.
+- Configuration values are validated strictly: integers and the `0`/`1`
+  flags are checked, as are session ids, before they are used.
+- Plan mode refuses more repository-changing git options (push and proxy
+  options, `--exec*`, upload-pack and sorting options) and no longer treats
+  `git ls-remote` as read-only.
+- Explorers never ask for approval: a tool call that would need one is
+  refused instead.
+- Text produced by the model is sanitized before it reaches the terminal,
+  and a path is resolved through symlinks before a directory is created.
 
 ## [0.3.0] - 2026-11-14
 
@@ -185,7 +214,8 @@ OpenAI-compatible endpoint (OpenCode Go).
 - Model output is trusted as JSON only as far as the API guarantees it; a
   malformed stream aborts the turn rather than being repaired.
 
-[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fb87/agent.sh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/fb87/agent.sh/releases/tag/v0.3.0
 [0.2.0]: https://github.com/fb87/agent.sh/releases/tag/v0.2.0
 [0.1.0]: https://github.com/fb87/agent.sh/releases/tag/v0.1.0

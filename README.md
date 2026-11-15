@@ -12,7 +12,8 @@ things in the current directory.
 
 There are two modes: build (the default) edits files and runs commands; plan
 only inspects. In build mode the model can also start read-only `explore`
-sub-agents to search the project in parallel.
+sub-agents to search the project in parallel, and it has `read`, `edit` and
+`write` tools for files plus `web_search` and `web_fetch` for the web.
 
 ## Install
 
@@ -106,6 +107,10 @@ the rest.
 | `AUTO` | `0` | `1` runs commands without asking (same as `-y`) |
 | `MODE` | `build` | `build` or `plan` |
 | `MAX_OUT` | `20000` | tool output bytes sent to the model |
+| `READ_LINES` | `400` | lines the `read` tool returns at most |
+| `WEB` | `1` | `0` removes `web_search` and `web_fetch` |
+| `WEB_TIMEOUT` | `30` | seconds one web call may take |
+| `SEARXNG_URL` | unset | SearXNG server for `web_search` |
 | `AUTO_COMPACT` | `1` | `0` turns automatic compaction off |
 | `CONTEXT` | `0` | model context window in tokens; `COMPACT_AT` then defaults to half of it (4 bytes per token) |
 | `COMPACT_AT` | half of `CONTEXT`, else `100000` | history bytes that trigger it |
@@ -132,6 +137,23 @@ the rest.
 | `AGENT_CONFIG` | `$XDG_CONFIG_HOME/agent.sh/config.json` | user config file |
 | `AGENT_CONFIG_DIR` | `$XDG_CONFIG_HOME/agent.sh` | config directory |
 | `AGENT_SYSTEM_CONFIG` | `/etc/agent.sh/config.json` | system config file |
+
+## Tools
+
+Besides `bash`, build mode gives the model three file tools and two web
+tools. `read` prints a file with line numbers (at most `READ_LINES` lines)
+and refuses binaries; reading inside the workspace needs no approval. `edit`
+replaces an exact string in a file and `write` creates or replaces one: both
+show a diff and ask first; a path outside the workspace needs approval too.
+Plan mode refuses all three.
+
+`web_search` returns titles, URLs and snippets, and `web_fetch` turns a page
+into text. They search with Brave (`BRAVE_API_KEY`), Tavily
+(`TAVILY_API_KEY`) or a SearXNG server (`SEARXNG_URL`) when configured, else
+with DuckDuckGo's HTML page, which needs no key but may refuse automated
+requests. `WEB=0` removes both tools, and `WEB_TIMEOUT` bounds one fetch or
+search. The keys can also be `brave_api_key`, `tavily_api_key` and
+`searxng_url` in the config file.
 
 ## Sub-agents
 
@@ -163,6 +185,11 @@ script; check `/about` to see which file each prompt came from.
 An `AGENTS.md` in the working directory is added to the system prompt, so
 project-specific instructions apply automatically. It is capped at 20 KB;
 `PROJECT_DOC=0` turns this off. `/about` shows whether one was used.
+
+A file `commands/NAME.md` in a prompt directory adds a prompt command:
+`/NAME` sends that file as the prompt. An HTML comment on the first line is
+the description `/help` shows next to it. `{{args}}` is replaced by the text
+after the name; when the file has no `{{args}}`, that text is appended.
 
 On the first run, `agent.sh` creates `$XDG_CONFIG_HOME/agent.sh/prompts/` and
 copies the bundled prompts into it as `NAME.md.example`. Rename one to

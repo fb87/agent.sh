@@ -47,8 +47,8 @@
 # key but may refuse automated requests. The keys can also be brave_api_key,
 # tavily_api_key and searxng_url in config.json.
 # Prompt commands: a file commands/NAME.md in a prompt directory is the
-# prompt that /NAME sends (/review, /commit, /fix, /test, /explain, /init are
-# bundled; /help lists them). Text after the name replaces {{args}}.
+# prompt that /NAME sends (commands/review.md makes /review; /help lists
+# the ones found). Text after the name replaces {{args}}.
 # The model can also start read-only sub-agents with the "explore" tool: each
 # is a separate agent.sh that may only inspect, and several run in parallel
 # (SUB_MAX at once, 4). SUBAGENTS=0 removes the tool; SUB_TIMEOUT (300) and
@@ -172,7 +172,7 @@ API_KEY=""                             # set by load_settings
 API_KEY_SOURCE=""
 CONFIG_LOADED=0
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
