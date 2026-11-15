@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CONTEXT` (tokens) for the model's context window. When it is set,
+  `COMPACT_AT` defaults to half of the window, counting 4 bytes per token
+  (e.g. `CONTEXT=128000` compacts at 256000 bytes), so compaction no longer
+  uses one hardcoded byte threshold for every model. Without `CONTEXT` the
+  old `100000`-byte threshold stays; a `COMPACT_AT` past the window produces
+  a warning, and `/model` shows the window and the threshold.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added

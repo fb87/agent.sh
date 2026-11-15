@@ -30,6 +30,9 @@
 # (AUTO_COMPACT=0 turns that off), also in the middle of a long turn;
 # /compact does it on demand. The latest exchange is kept as it is when it
 # is small enough, and everything before it becomes the summary.
+# CONTEXT is the model's window in tokens. When it is set, COMPACT_AT
+# defaults to half of it, at 4 bytes per token (CONTEXT=128000 compacts at
+# 256000 bytes); unset or 0, it keeps the old 100000 bytes.
 # Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
 # "model", "url" and "api_key" (plus reasoning, thinking and temperature).
 # Environment variables win over that file.
@@ -111,9 +114,10 @@ THINKING=""                            # on/off ("" = server default)
 TEMPERATURE=""                         # 0..2 ("" = server default)
 AUTO="${AUTO:-0}"                      # 1 = no confirmation prompt
 MODE="${MODE:-build}"                  # build (edits) or plan (read-only)
+CONTEXT="${CONTEXT:-0}"                # model context window in tokens (0 = unknown)
 MAX_OUT="${MAX_OUT:-20000}"            # tool output bytes sent to the model
 AUTO_COMPACT="${AUTO_COMPACT:-1}"      # 1 = auto-summarize a long history
-COMPACT_AT="${COMPACT_AT:-100000}"     # history bytes that trigger that
+COMPACT_AT="${COMPACT_AT:-}"           # history bytes that trigger that; see below
 TIMEOUT="${TIMEOUT:-300}"              # seconds of silence before giving up
 OUTSIDE="${OUTSIDE:-ask}"              # outside the workspace: ask, allow, deny
 # Programs that always need approval, also under -y ("" = none)
@@ -492,6 +496,12 @@ model_info() {
   printf '  %-11s %s\n' reasoning "${REASONING:-server default}"
   printf '  %-11s %s\n' thinking "${THINKING:-server default}"
   printf '  %-11s %s\n' temperature "${TEMPERATURE:-server default}"
+  if (( CONTEXT > 0 )); then
+    printf '  %-11s %s tokens (compacts at %s bytes)\n' context "$CONTEXT" \
+      "$COMPACT_AT"
+  else
+    printf '  %-11s unknown (compacts at %s bytes)\n' context "$COMPACT_AT"
+  fi
   printf '  %-11s %s\n' endpoint "$URL"
   printf 'Change one with: /model set <model|reasoning|thinking|'\
 'temperature> <value>\n'
@@ -578,7 +588,12 @@ about() {
     printf '  %-9s %s\n' mode 'build (edits and commands allowed)'
   fi
   if (( AUTO_COMPACT )); then
-    printf '  %-9s automatic above %s bytes\n' compact "$COMPACT_AT"
+    if (( CONTEXT > 0 )); then
+      printf '  %-9s automatic above %s bytes (%s tokens)\n' compact \
+        "$COMPACT_AT" "$(( COMPACT_AT / 4 ))"
+    else
+      printf '  %-9s automatic above %s bytes\n' compact "$COMPACT_AT"
+    fi
   else
     printf '  %-9s only with /compact\n' compact
   fi
@@ -719,11 +734,27 @@ done
   { echo "agent.sh: SUBAGENTS must be 0 or 1" >&2; exit 2; }
 [[ "$WEB" == 0 || "$WEB" == 1 ]] ||
   { echo "agent.sh: WEB must be 0 or 1" >&2; exit 2; }
+[[ "$CONTEXT" =~ ^(0|[1-9][0-9]*)$ ]] ||
+  { echo "agent.sh: CONTEXT must be a whole number (0 = unknown)" >&2
+    exit 2; }
+# With a known window, compact at half of it, counting 4 bytes per token, so
+# the summary request (the whole head plus the prompt) still fits. Without
+# one, keep the old byte threshold.
+if [[ -z "$COMPACT_AT" ]]; then
+  if (( CONTEXT > 0 )); then COMPACT_AT=$(( CONTEXT * 2 ))
+  else COMPACT_AT=100000; fi
+fi
 for dep in WEB_TIMEOUT READ_LINES MAX_OUT COMPACT_AT TIMEOUT \
            AGENT_HISTORY_MAX; do
   [[ "${!dep}" =~ ^[1-9][0-9]*$ ]] ||
     { echo "agent.sh: $dep must be a whole number above 0" >&2; exit 2; }
 done
+# A threshold at or past the window cannot be compacted in one request
+if (( CONTEXT > 0 && COMPACT_AT >= CONTEXT * 4 )); then
+  printf 'agent.sh: warning: COMPACT_AT (%s bytes) reaches the %s-token' \
+    "$COMPACT_AT" "$CONTEXT" >&2
+  printf ' context window; raise CONTEXT or lower COMPACT_AT\n' >&2
+fi
 (( SUB_MAX > 0 )) || SUB_MAX=1
 case "$OUTSIDE" in
   ask|allow|deny) ;;

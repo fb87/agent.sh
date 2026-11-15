@@ -107,7 +107,8 @@ the rest.
 | `MODE` | `build` | `build` or `plan` |
 | `MAX_OUT` | `20000` | tool output bytes sent to the model |
 | `AUTO_COMPACT` | `1` | `0` turns automatic compaction off |
-| `COMPACT_AT` | `100000` | history bytes that trigger it |
+| `CONTEXT` | `0` | model context window in tokens; `COMPACT_AT` then defaults to half of it (4 bytes per token) |
+| `COMPACT_AT` | half of `CONTEXT`, else `100000` | history bytes that trigger it |
 | `TIMEOUT` | `300` | seconds of API silence before giving up |
 | `CMD_TIMEOUT` | `600` | seconds one command may run (`0` = no cap) |
 | `OUTSIDE` | `ask` | commands outside the workspace: `ask`, `allow` or `deny` |
