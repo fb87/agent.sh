@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses one hardcoded byte threshold for every model. Without `CONTEXT` the
   old `100000`-byte threshold stays; a `COMPACT_AT` past the window produces
   a warning, and `/model` shows the window and the threshold.
+- `nix flake check` now runs `shellcheck` on `agent.sh`, so linting (and the
+  quoting, `eval` and word-splitting findings behind most script security
+  bugs) is part of the check instead of an optional local habit.
 
 ## [0.3.0] - 2026-11-14
 

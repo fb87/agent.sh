@@ -224,7 +224,7 @@ elsewhere.
 ```sh
 nix develop        # bash, jq, curl, shellcheck
 nix build          # ./result/bin/agent.sh
-nix flake check
+nix flake check    # builds it and lints agent.sh with shellcheck
 ```
 
 ## License

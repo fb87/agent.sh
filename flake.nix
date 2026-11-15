@@ -60,5 +60,16 @@
       );
 
       formatter = forAllSystems ({ pkgs, ... }: pkgs.nixfmt);
+
+      checks = forAllSystems (
+        { pkgs, ... }: {
+          shellcheck = pkgs.runCommandLocal "agent-sh-shellcheck" {
+            nativeBuildInputs = [ pkgs.shellcheck ];
+          } ''
+            shellcheck ${./agent.sh}
+            touch $out
+          '';
+        }
+      );
     };
 }

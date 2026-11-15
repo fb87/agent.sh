@@ -2,6 +2,8 @@
 # vim: set ts=2 sw=2 sts=2 et ai tw=80 cc=80 ft=sh :
 # shellcheck disable=SC2016,SC2030,SC2031,SC2329
 # (jq programs are single-quoted on purpose; tools are called as "tool_$name")
+# Keep this file clean: nix develop -c shellcheck agent.sh (also run by
+# nix flake check). Never silence a finding without a comment saying why.
 # agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
 #
 # Usage: agent.sh [-y] [-p | -b] [-i] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
