@@ -31,6 +31,16 @@
 # Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
 # "model", "url" and "api_key" (plus reasoning, thinking and temperature).
 # Environment variables win over that file.
+# Tools the model has: bash; read, edit and write for files (reading inside
+# the workspace needs no approval; edit and write show the change and ask);
+# web_search and web_fetch (WEB=0 removes them); explore (below). web_search
+# uses Brave (BRAVE_API_KEY), Tavily (TAVILY_API_KEY) or a SearXNG server
+# (SEARXNG_URL) when one is set, else DuckDuckGo's HTML page, which needs no
+# key but may refuse automated requests. The keys can also be brave_api_key,
+# tavily_api_key and searxng_url in config.json.
+# Prompt commands: a file commands/NAME.md in a prompt directory is the
+# prompt that /NAME sends (/review, /commit, /fix, /test, /explain, /init are
+# bundled; /help lists them). Text after the name replaces {{args}}.
 # The model can also start read-only sub-agents with the "explore" tool: each
 # is a separate agent.sh that may only inspect, and several run in parallel
 # (SUB_MAX at once, 4). SUBAGENTS=0 removes the tool; SUB_TIMEOUT (300) and
@@ -42,7 +52,8 @@
 # and EXPLORE.md (the instructions an explorer gets).
 # They are looked up in $PROMPT_DIR (if set), then in
 # $XDG_CONFIG_HOME/agent.sh/prompts, then in <install dir>/pro.mpts; a missing
-# or blank file keeps the built-in, and {{cwd}} is the working directory.
+# or blank file keeps the built-in. In a prompt, {{cwd}} is the working
+# directory, {{workspace}} the workspace, {{os}} the system and {{date}} today.
 # On the first run the config directory is created and the bundled prompts are
 # copied into it as NAME.md.example; rename one to NAME.md to override that
 # prompt. A fresh session also prints /about.
@@ -82,7 +93,9 @@ OPENCODE_API_KEY_ENV_SET=${OPENCODE_API_KEY+1}
 OPENCODE_API_KEY_ENV="${OPENCODE_API_KEY-}"
 # The key stays in this shell only: commands the model runs must not inherit
 # it (an "env" would put it in the transcript and send it to the provider).
-unset AGENT_API_KEY OPENCODE_API_KEY
+BRAVE_KEY="${BRAVE_API_KEY-}"
+TAVILY_KEY="${TAVILY_API_KEY-}"
+unset AGENT_API_KEY OPENCODE_API_KEY BRAVE_API_KEY TAVILY_API_KEY
 # Sessions, history and temp files hold command output and may hold secrets:
 # create them private. Commands the model runs get the original umask back.
 ORIG_UMASK=$(umask)
@@ -106,6 +119,13 @@ ASK_CMDS="${ASK_CMDS-sudo su doas pkexec dd mkfs fdisk parted shutdown reboot \
 poweroff halt systemctl nixos-rebuild crontab chown mount umount}"
 WORKSPACE="${WORKSPACE:-}"             # default: the git repository, else $PWD
 ALLOW_PATHS="${ALLOW_PATHS:-}"         # extra directories, colon-separated
+WEB="${WEB:-1}"                        # 1 = offer web_fetch and web_search
+WEB_TIMEOUT="${WEB_TIMEOUT:-30}"       # seconds one fetch or search may take
+SEARXNG_URL="${SEARXNG_URL:-}"         # a SearXNG server to search with
+BRAVE_URL="${BRAVE_URL:-https://api.search.brave.com/res/v1/web/search}"
+TAVILY_URL="${TAVILY_URL:-https://api.tavily.com/search}"
+DDG_URL="${DDG_URL:-https://html.duckduckgo.com/html/}"
+READ_LINES="${READ_LINES:-400}"        # lines the read tool returns at most
 SUBAGENTS="${SUBAGENTS:-1}"            # 1 = offer the explore tool (sub-agents)
 SUB_MAX="${SUB_MAX:-4}"                # explorers running at the same time
 SUB_TIMEOUT="${SUB_TIMEOUT:-300}"      # seconds one explorer may take (0 = no cap)
@@ -200,6 +220,13 @@ load_config_file() {
   if [[ -n "$v" ]]; then URL="$v"; fi
   v=$(config_get "$f" api_key)
   if [[ -n "$v" ]]; then API_KEY="$v"; API_KEY_SOURCE="config"; fi
+  # Web search: the environment wins over the file
+  v=$(config_get "$f" brave_api_key)
+  if [[ -n "$v" && -z "$BRAVE_KEY" ]]; then BRAVE_KEY="$v"; fi
+  v=$(config_get "$f" tavily_api_key)
+  if [[ -n "$v" && -z "$TAVILY_KEY" ]]; then TAVILY_KEY="$v"; fi
+  v=$(config_get "$f" searxng_url)
+  if [[ -n "$v" && -z "$SEARXNG_URL" ]]; then SEARXNG_URL="$v"; fi
   v=$(config_get "$f" reasoning)
   if [[ -n "$v" ]]; then
     case "$v" in
@@ -326,10 +353,76 @@ init_config_dir() {
   printf ' rename one to *.md to override it\n' >&2
 }
 
-# The text of the first non-blank <prompt dir>/$1, else $2. {{cwd}} in it
-# stands for the working directory (the file cannot expand it).
+# FILLED = $1 with the placeholders a prompt file may use replaced:
+# {{cwd}} the starting directory, {{workspace}} the workspace, {{os}} the
+# system (uname -sm), {{date}} today's date.
+fill_placeholders() {
+  FILLED=$1
+  FILLED=${FILLED//'{{cwd}}'/"$PWD"}
+  FILLED=${FILLED//'{{workspace}}'/"${WORKSPACE:-$PWD}"}
+  FILLED=${FILLED//'{{os}}'/"${OS_NAME:-}"}
+  FILLED=${FILLED//'{{date}}'/"${TODAY:-}"}
+}
+
+# Prompt commands: <prompt dir>/commands/NAME.md is the prompt that /NAME
+# sends. Its first line may be a description for /help, as an HTML comment
+# (<!-- Review the uncommitted changes -->). {{args}} in it stands for what
+# was typed after the name; without {{args}}, that text is added at the end.
+
+# CMD_FILE = the file of prompt command $1, or returns 1
+find_command() {
+  local dir
+  for dir in "${PROMPT_DIRS[@]}"; do
+    if [[ -f "$dir/commands/$1.md" ]]; then
+      CMD_FILE="$dir/commands/$1.md"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prints the prompt of command file $1 for the arguments $2
+render_command() {
+  local t first args="$2"
+  t=$(cat "$1" 2>/dev/null) || t=""
+  first=${t%%$'\n'*}
+  if [[ "$first" == '<!--'*'-->'* ]]; then t=${t#*$'\n'}; fi
+  fill_placeholders "$t"
+  t=$FILLED
+  if [[ "$t" == *'{{args}}'* ]]; then
+    t=${t//'{{args}}'/"$args"}
+  elif [[ -n "$args" ]]; then
+    t+=$'\n\n'"$args"
+  fi
+  printf '%s' "$t"
+}
+
+# Lists the prompt commands for /help: name and description
+list_commands() {
+  local dir f name first seen=" "
+  for dir in "${PROMPT_DIRS[@]}"; do
+    for f in "$dir"/commands/*.md; do
+      [[ -f "$f" ]] || continue
+      name=${f##*/}; name=${name%.md}
+      [[ "$seen" == *" $name "* ]] && continue
+      seen+="$name "
+      first=$(head -n 1 "$f" 2>/dev/null) || first=""
+      if [[ "$first" == '<!--'*'-->'* ]]; then
+        first=${first#'<!--'}; first=${first%%'-->'*}
+        first=${first#"${first%%[![:space:]]*}"}
+        first=${first%"${first##*[![:space:]]}"}
+      else
+        first="prompt from $f"
+      fi
+      printf '/%-15s %s\n' "$name" "$first"
+    done
+  done
+}
+
+# The text of the first non-blank <prompt dir>/$1, else $2, with the
+# placeholders filled in.
 read_prompt() {
-  local name="$1" fallback="$2" dir f t="" ph='{{cwd}}' i=0
+  local name="$1" fallback="$2" dir f t=""
   PROMPT_FROM="built-in"
   for dir in "${PROMPT_DIRS[@]}"; do
     f="$dir/$name"
@@ -339,10 +432,8 @@ read_prompt() {
     t=${t%"${t##*[![:space:]]}"}
     if [[ -n "$t" ]]; then PROMPT_FROM="$f"; break; fi
   done
-  while [[ "$t" == *"$ph"* ]] && (( i++ < 100 )); do
-    t="${t%%"$ph"*}${PWD}${t#*"$ph"}"
-  done
-  printf '%s' "${t:-$fallback}"
+  fill_placeholders "${t:-$fallback}"
+  printf '%s' "$FILLED"
 }
 
 # Which prompts are in use, for /about
@@ -486,6 +577,14 @@ about() {
   printf '  %-9s %s\n' project "${PROJECT_DOC_USED:-no AGENTS.md here}"
   printf '  %-9s %s (outside it: %s)\n' workspace "${WORKSPACE:-$PWD}" \
     "$OUTSIDE"
+  printf '  %-9s %s\n' tools "$TOOL_NAMES"
+  if (( WEB )); then
+    if [[ -n "$BRAVE_KEY" ]]; then printf '  %-9s Brave\n' search
+    elif [[ -n "$TAVILY_KEY" ]]; then printf '  %-9s Tavily\n' search
+    elif [[ -n "$SEARXNG_URL" ]]; then printf '  %-9s %s\n' search "$SEARXNG_URL"
+    else printf '  %-9s DuckDuckGo (no key; may refuse requests)\n' search
+    fi
+  fi
   if (( SUBAGENTS )); then
     printf '  %-9s explore tool on, up to %s in parallel\n' explorers "$SUB_MAX"
   else
@@ -591,7 +690,7 @@ FIRST_PROMPT="$*"
 ONESHOT=0                              # a prompt on the command line: answer, exit
 if [[ -n "$FIRST_PROMPT" ]] && (( ! INTERACTIVE )); then ONESHOT=1; fi
 if [[ "$SUB" == 1 ]]; then              # an explorer: read-only, never asks
-  MODE=plan; AUTO=1; SUBAGENTS=0; MAX_STEPS="$SUB_MAX_STEPS"
+  MODE=plan; AUTO=1; SUBAGENTS=0; WEB=0; MAX_STEPS="$SUB_MAX_STEPS"
   [[ -n "$FIRST_PROMPT" ]] ||
     { echo "agent.sh: an explorer needs a task" >&2; exit 2; }
   ONESHOT=1
@@ -604,6 +703,12 @@ for dep in SUB_MAX SUB_TIMEOUT SUB_MAX_STEPS MAX_STEPS; do
 done
 [[ "$SUBAGENTS" == 0 || "$SUBAGENTS" == 1 ]] ||
   { echo "agent.sh: SUBAGENTS must be 0 or 1" >&2; exit 2; }
+[[ "$WEB" == 0 || "$WEB" == 1 ]] ||
+  { echo "agent.sh: WEB must be 0 or 1" >&2; exit 2; }
+for dep in WEB_TIMEOUT READ_LINES; do
+  [[ "${!dep}" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "agent.sh: $dep must be a whole number above 0" >&2; exit 2; }
+done
 (( SUB_MAX > 0 )) || SUB_MAX=1
 case "$OUTSIDE" in
   ask|allow|deny) ;;
@@ -620,6 +725,39 @@ build_prompt_dirs
 init_config_dir
 load_settings
 warn_config_permissions
+
+START_DIR="$PWD"
+# The workspace: where commands may work without a question. The repository
+# that contains the starting directory, if there is one, else that directory.
+if [[ -z "$WORKSPACE" ]]; then
+  WORKSPACE=$(git -C "$START_DIR" rev-parse --show-toplevel 2>/dev/null) ||
+    WORKSPACE=""
+  if [[ -z "$WORKSPACE" ]]; then
+    WORKSPACE="$START_DIR"               # not in a repository
+  else
+    case "$START_DIR/" in
+      "$WORKSPACE"/*) ;;
+      *) WORKSPACE="$START_DIR" ;;       # reached through a symbolic link
+    esac
+  fi
+fi
+WORKSPACE=${WORKSPACE%/}
+[[ -n "$WORKSPACE" ]] || WORKSPACE=/
+# System locations a normal user can read but not change, and scratch space:
+# naming these needs no question.
+OUTSIDE_ALLOW=(/usr /bin /sbin /lib /lib32 /lib64 /libexec /opt /etc
+               /nix/store /run/current-system /proc /sys /dev /tmp /var/tmp
+               /private/tmp)
+if [[ -n "${TMPDIR:-}" ]]; then OUTSIDE_ALLOW+=("${TMPDIR%/}"); fi
+if [[ -n "$ALLOW_PATHS" ]]; then
+  IFS=: read -ra dep <<<"$ALLOW_PATHS"
+  for pid in ${dep[@]+"${dep[@]}"}; do
+    if [[ "$pid" == /* ]]; then OUTSIDE_ALLOW+=("${pid%/}"); fi
+  done
+fi
+WORKSPACE_PHYS=$(cd -P "$WORKSPACE" 2>/dev/null && pwd -P) || WORKSPACE_PHYS=""
+OS_NAME=$(uname -sm 2>/dev/null) || OS_NAME="unknown"
+TODAY=$(date '+%Y-%m-%d' 2>/dev/null) || TODAY=""
 
 SYSTEM_DEFAULT="You are a coding agent working in the user's current directory
 ($PWD). Use the bash tool to inspect, create, edit and run files. Each command
@@ -662,32 +800,86 @@ EXPLORE_DEFAULT+='could not determine. Report only what you saw.'
 EXPLORE_PROMPT=$(read_prompt EXPLORE.md "$EXPLORE_DEFAULT")
 SYSTEM="$BASE_SYSTEM"
 
-# OpenAI-style tool definitions
+# OpenAI-style tool definitions. An explorer gets bash and read only.
 # Built with jq: a JSON string cannot be broken across lines
-TOOLS=$(jq -cn --argjson sub "$SUBAGENTS" '
-  [{type: "function", function: {
-    name: "bash",
-    description: ("Run a bash script in the current directory. Returns " +
-                  "combined stdout/stderr and the exit code if non-zero."),
-    parameters: {type: "object",
-      properties: {command: {type: "string",
-        description: "The bash command or script to run"}},
-      required: ["command"]}}}]
-  + (if $sub == 1 then
-  [{type: "function", function: {
-    name: "explore",
-    description: ("Start a read-only sub-agent that explores the project " +
-                  "and returns a report. It can only run read-only commands " +
-                  "and does not see this conversation, so give it a " +
-                  "self-contained task: what to find out, where to look, " +
-                  "and what to report. Several explore calls in one reply " +
-                  "run in parallel: split a broad search into independent " +
-                  "tasks. Use bash yourself for a quick single lookup."),
-    parameters: {type: "object",
-      properties: {task: {type: "string",
-        description: "What the explorer should find out and report"}},
-      required: ["task"]}}}]
+TOOLS=$(jq -cn --argjson explore "$SUBAGENTS" --argjson web "$WEB" \
+              --argjson sub "$SUB" --argjson lines "$READ_LINES" '
+  def tool(n; d; props; req):
+    {type: "function", function: {name: n, description: d,
+      parameters: {type: "object", properties: props, required: req}}};
+  [tool("bash";
+     "Run a bash script in the working directory and return its combined "
+     + "stdout and stderr, plus the exit code if it is not 0. Each call is a "
+     + "new non-interactive shell: nothing carries over, and there is no "
+     + "terminal or stdin. Use it to run builds, tests, git and any other "
+     + "program, and to search (grep -rn, find, ls).";
+     {command: {type: "string",
+                description: "The bash command or script to run"}};
+     ["command"]),
+   tool("read";
+     "Read a text file. Returns the lines with their line numbers "
+     + "(\"    12<TAB>text\"), at most \($lines) lines per call; use offset "
+     + "to read further. Prefer this to cat: it needs no approval inside "
+     + "the workspace.";
+     {path: {type: "string",
+             description: ("File path, absolute or relative to the "
+                           + "working directory")},
+      offset: {type: "integer",
+               description: "First line to return, counted from 1"},
+      limit: {type: "integer", description: "How many lines to return"}};
+     ["path"])]
+  + (if $sub == 1 then [] else
+  [tool("edit";
+     "Change a file by replacing text. old must match the file exactly "
+     + "(every space, tab and line break) and, unless replace_all is true, "
+     + "in exactly one place: include enough surrounding lines to make it "
+     + "unique. Copy old from a read result without the line numbers. Read "
+     + "the file first.";
+     {path: {type: "string", description: "File to change"},
+      old: {type: "string", description: "The exact text to replace"},
+      new: {type: "string", description: "The text to put in its place"},
+      replace_all: {type: "boolean",
+                    description: "Replace every match instead of one"}};
+     ["path", "old", "new"]),
+   tool("write";
+     "Create a file, or replace the whole content of an existing one. "
+     + "Missing directories are created. For a change to part of an "
+     + "existing file, use edit instead.";
+     {path: {type: "string", description: "File to create or replace"},
+      content: {type: "string", description: "The complete file content"}};
+     ["path", "content"])] end)
+  + (if $web == 1 then
+  [tool("web_search";
+     "Search the web. Returns numbered results: title, URL and a short "
+     + "snippet. Use it for things that may have changed or that you do not "
+     + "know: current versions, error messages, API documentation. Follow "
+     + "up with web_fetch on the best result; do not answer from snippets "
+     + "alone.";
+     {query: {type: "string", description: "Search terms, a few words"},
+      count: {type: "integer",
+              description: "Results to return, 1-10 (default 5)"}};
+     ["query"]),
+   tool("web_fetch";
+     "Fetch a web page or file by URL (http or https) and return its text; "
+     + "HTML is converted to plain text. Use it to read documentation, "
+     + "release notes or an issue the user linked.";
+     {url: {type: "string", description: "The full URL"}};
+     ["url"])]
+  else [] end)
+  + (if $explore == 1 then
+  [tool("explore";
+     "Start a read-only sub-agent that explores the project and returns a "
+     + "report. It can only read files and run read-only commands, and it "
+     + "does not see this conversation, so give it a self-contained task: "
+     + "what to find out, where to look, and what to report. Several "
+     + "explore calls in one reply run in parallel: split a broad search "
+     + "into independent tasks. For one quick lookup, use read or bash "
+     + "yourself.";
+     {task: {type: "string",
+             description: "What the explorer should find out and report"}};
+     ["task"])]
   else [] end)')
+TOOL_NAMES=$(jq -r '[.[].function.name] | join(", ")' <<<"$TOOLS")
 
 # Scratch files live beside the sessions, not in /tmp: a command that cleans
 # /tmp must not take the agent's files with it. The directory name carries our
@@ -734,35 +926,6 @@ done
 SETSID_BIN=""
 if command -v setsid >/dev/null 2>&1 && setsid true >/dev/null 2>&1; then
   SETSID_BIN=setsid
-fi
-START_DIR="$PWD"
-# The workspace: where commands may work without a question. The repository
-# that contains the starting directory, if there is one, else that directory.
-if [[ -z "$WORKSPACE" ]]; then
-  WORKSPACE=$(git -C "$START_DIR" rev-parse --show-toplevel 2>/dev/null) ||
-    WORKSPACE=""
-  if [[ -z "$WORKSPACE" ]]; then
-    WORKSPACE="$START_DIR"               # not in a repository
-  else
-    case "$START_DIR/" in
-      "$WORKSPACE"/*) ;;
-      *) WORKSPACE="$START_DIR" ;;       # reached through a symbolic link
-    esac
-  fi
-fi
-WORKSPACE=${WORKSPACE%/}
-[[ -n "$WORKSPACE" ]] || WORKSPACE=/
-# System locations a normal user can read but not change, and scratch space:
-# naming these needs no question.
-OUTSIDE_ALLOW=(/usr /bin /sbin /lib /lib32 /lib64 /libexec /opt /etc
-               /nix/store /run/current-system /proc /sys /dev /tmp /var/tmp
-               /private/tmp)
-if [[ -n "${TMPDIR:-}" ]]; then OUTSIDE_ALLOW+=("${TMPDIR%/}"); fi
-if [[ -n "$ALLOW_PATHS" ]]; then
-  IFS=: read -ra dep <<<"$ALLOW_PATHS"
-  for pid in ${dep[@]+"${dep[@]}"}; do
-    if [[ "$pid" == /* ]]; then OUTSIDE_ALLOW+=("${pid%/}"); fi
-  done
 fi
 [[ "$CMD_TIMEOUT" =~ ^[0-9]+$ ]] ||
   { echo "agent.sh: CMD_TIMEOUT must be a whole number of seconds" >&2; exit 2; }
@@ -1312,6 +1475,87 @@ plan_allows() {
 # <<< plan guard
 
 RISK_OK=0                  # 1 = "always" was answered for dangerous commands
+GATE_OK=""                 # 1 = the user said yes at the gate
+
+# The question that -y does not answer. $1 = the places outside the workspace
+# a tool call would touch, $2 = what is dangerous about it (either may be
+# empty). Returns 0 if the call may go on (GATE_OK=1 if the user said yes
+# here), 1 if not, with the reason for the model in TOOL_OUT. Needs fd 9.
+gate() {
+  local outside="$1" risky="$2" why="" ok=""
+  GATE_OK=""
+  [[ -n "$outside" || -n "$risky" ]] || return 0
+  if [[ -n "$outside" ]]; then
+    why="it reaches outside the workspace ($WORKSPACE): $outside"
+  fi
+  if [[ -n "$risky" ]]; then why+="${why:+; }it is dangerous: $risky"; fi
+  TOOL_OUT="Not run: $why."
+  if [[ -n "$outside" && "$OUTSIDE" == deny ]]; then
+    TOOL_OUT+=" Leaving the workspace is not allowed in this session; work"
+    TOOL_OUT+=" inside it."
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+    return 1
+  fi
+  if ! { true </dev/tty; } 2>/dev/null; then
+    TOOL_OUT+=" It needs the user's approval and there is no terminal to"
+    TOOL_OUT+=" ask on. Find another way, or tell the user what you need"
+    TOOL_OUT+=" and why."
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+    return 1
+  fi
+  printf '\033[35mNeeds your approval: %s\033[0m\n' "$why" >&2
+  read -rp "Allow it? [y/N/a=always this session, or say why not] " ok \
+    </dev/tty || ok=""
+  case "$ok" in
+    [Yy]|[Yy][Ee][Ss]) GATE_OK=1 ;;
+    [Aa]|[Aa]lways)
+      GATE_OK=1
+      if [[ -n "$outside" ]]; then
+        OUTSIDE=allow
+        echo "Tools may now leave the workspace without asking." >&2
+      fi
+      if [[ -n "$risky" ]]; then
+        RISK_OK=1
+        echo "Dangerous commands now run without this question." >&2
+      fi ;;
+    ""|[Nn]|[Nn][Oo])
+      TOOL_OUT+=" The user did not allow it."
+      printf '%s\n' "$TOOL_OUT" >&2
+      return 1 ;;
+    *)
+      TOOL_OUT+=" The user did not allow it and said: $ok"
+      printf '%s\n' "$TOOL_OUT" >&2
+      return 1 ;;
+  esac
+  return 0
+}
+
+# The ordinary question, which -y (or answering "a") turns off. $1 = the
+# question, $2 = what was declined ("to run this command"), $3 = what to do
+# when there is no terminal. Returns 1 with TOOL_OUT set if the answer is no.
+confirm() {
+  local ok=""
+  [[ "$AUTO" == 1 ]] && return 0
+  if ! { true </dev/tty; } 2>/dev/null; then     # nothing to ask the user on
+    TOOL_OUT="The user declined $2 (no terminal to ask on; $3)."
+    printf '%s\n' "$TOOL_OUT" >&2
+    return 1
+  fi
+  read -rp "$1 [y/N/a=always, or say why not] " ok </dev/tty || ok=""
+  case "$ok" in
+    [Yy]|[Yy][Ee][Ss]) return 0 ;;
+    [Aa]|[Aa]lways)
+      AUTO=1
+      echo "Tool calls now run without asking (/auto to undo)." >&2
+      return 0 ;;
+    ""|[Nn]|[Nn][Oo])
+      TOOL_OUT="The user declined $2." ;;
+    *)  # anything else is the reason, passed on so the model can adjust
+      TOOL_OUT="The user declined $2 and said: $ok" ;;
+  esac
+  printf '%s\n' "$TOOL_OUT" >&2
+  return 1
+}
 
 # The text of file $1 for the model, in CLIPPED: at most MAX_OUT bytes, keeping
 # the head and the tail and saying what was cut
@@ -1438,6 +1682,17 @@ risky_cmds() {
   if [[ "$1" =~ (curl|wget)[^\;\&]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|da)?sh ]]
   then printf 'download piped into a shell\n'; fi
 }
+# True if the absolute, normalized path $1 needs no question: it is in the
+# workspace or in one of the locations in OUTSIDE_ALLOW
+path_is_free() {
+  local a
+  case "$1/" in "$WORKSPACE"/*|"$START_DIR"/*) return 0 ;; esac
+  if [[ "$WORKSPACE" == / ]]; then return 0; fi
+  for a in "${OUTSIDE_ALLOW[@]}"; do
+    case "$1/" in "$a"/*) return 0 ;; esac
+  done
+  return 1
+}
 # <<< outside check
 
 # True if $1 would signal processes by a name that matches the agent itself, or
@@ -1497,7 +1752,7 @@ run_tool() {
 
 run_tool_body() {
   local cmd="$1" ok="" rc=0 out note="" tpid i=0 left=""
-  local got_term=0 gone="" outside="" approved="" risky="" why
+  local got_term=0 gone="" outside="" risky=""
   local -a run=()
   if (( SUB )); then
     # One dim line per command; the parent's terminal is shared with others
@@ -1530,73 +1785,10 @@ run_tool_body() {
     risky=$(risky_cmds "$cmd" | head -n 8 | tr '\n' ',')
     risky=${risky%,}; risky=${risky//,/, }
   fi
-  if [[ -n "$outside" || -n "$risky" ]]; then
-    why=""
-    if [[ -n "$outside" ]]; then
-      why="it reaches outside the workspace ($WORKSPACE): $outside"
-    fi
-    if [[ -n "$risky" ]]; then why+="${why:+; }it is dangerous: $risky"; fi
-    TOOL_OUT="Not run: $why."
-    if [[ -n "$outside" && "$OUTSIDE" == deny ]]; then
-      TOOL_OUT+=" Leaving the workspace is not allowed in this session; work"
-      TOOL_OUT+=" inside it."
-      printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
-      return
-    fi
-    if ! { true </dev/tty; } 2>/dev/null; then
-      TOOL_OUT+=" It needs the user's approval and there is no terminal to"
-      TOOL_OUT+=" ask on. Find another way, or tell the user what you need"
-      TOOL_OUT+=" and why."
-      printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
-      return
-    fi
-    printf '\033[35mNeeds your approval: %s\033[0m\n' "$why" >&2
-    read -rp "Allow it? [y/N/a=always this session, or say why not] " ok \
-      </dev/tty || ok=""
-    case "$ok" in
-      [Yy]|[Yy][Ee][Ss]) approved=1 ;;
-      [Aa]|[Aa]lways)
-        approved=1
-        if [[ -n "$outside" ]]; then
-          OUTSIDE=allow
-          echo "Commands may now leave the workspace without asking." >&2
-        fi
-        if [[ -n "$risky" ]]; then
-          RISK_OK=1
-          echo "Dangerous commands now run without this question." >&2
-        fi ;;
-      ""|[Nn]|[Nn][Oo])
-        TOOL_OUT+=" The user did not allow it."
-        printf '%s\n' "$TOOL_OUT" >&2
-        return ;;
-      *)
-        TOOL_OUT+=" The user did not allow it and said: $ok"
-        printf '%s\n' "$TOOL_OUT" >&2
-        return ;;
-    esac
-  fi
-  if [[ "$AUTO" != 1 && -z "$approved" ]]; then
-    if ! { true </dev/tty; } 2>/dev/null; then   # nothing to ask the user on
-      TOOL_OUT="The user declined to run this command (no terminal to ask"
-      TOOL_OUT+=" on; run with -y to approve commands up front)."
-      printf '%s\n' "$TOOL_OUT" >&2
-      return
-    fi
-    read -rp "Run it? [y/N/a=always, or say why not] " ok </dev/tty || ok=""
-    case "$ok" in
-      [Yy]|[Yy][Ee][Ss]) ;;
-      [Aa]|[Aa]lways)
-        AUTO=1
-        echo "Commands now run without asking (/auto to undo)." >&2 ;;
-      ""|[Nn]|[Nn][Oo])
-        TOOL_OUT="The user declined to run this command."
-        printf '%s\n' "$TOOL_OUT" >&2
-        return ;;
-      *)  # anything else is the reason, passed on so the model can adjust
-        TOOL_OUT="The user declined to run this command and said: $ok"
-        printf '%s\n' "$TOOL_OUT" >&2
-        return ;;
-    esac
+  gate "$outside" "$risky" || return 0
+  if [[ -z "$GATE_OK" ]]; then
+    confirm "Run it?" "to run this command" \
+      "run with -y to approve commands up front" || return 0
   fi
   # A command may have removed the directory we work in or our scratch files
   ensure_tmp
@@ -1701,6 +1893,453 @@ run_tool_body() {
   TOOL_OUT="$out"
 }
 
+# ---------------------------------------------------------------- file tools
+
+# read, write and edit work on one file. Reading inside the workspace needs
+# no question; write and edit show the change and ask like a command does.
+# All three stop at the workspace like bash commands do (the gate above).
+
+# Resolves the path $1 of a tool call. FILE_PATH = the absolute path, by name;
+# FILE_OUTSIDE = that path if using it needs the gate, else empty.
+file_target() {
+  local p="$1" phys
+  case "$p" in
+    "~"|"~/"*) p="$HOME${p:1}" ;;
+    /*) ;;
+    *)  p="$START_DIR/$p" ;;
+  esac
+  norm_path "$p"
+  FILE_PATH=$NORM
+  FILE_OUTSIDE=""
+  [[ "$OUTSIDE" == allow ]] && return 0
+  if ! path_is_free "$FILE_PATH"; then
+    FILE_OUTSIDE="$FILE_PATH"
+    return 0
+  fi
+  # Inside by name; a symbolic link may still lead out
+  if [[ -L "$FILE_PATH" ]]; then
+    FILE_OUTSIDE="$FILE_PATH (a symbolic link)"
+    return 0
+  fi
+  phys=$(cd -P "${FILE_PATH%/*}/" 2>/dev/null && pwd -P) || phys=""
+  if [[ -n "$phys" && -n "$WORKSPACE_PHYS" ]] && ! path_is_free "$phys"; then
+    case "$phys/" in
+      "$WORKSPACE_PHYS"/*) ;;
+      *) FILE_OUTSIDE="$FILE_PATH (through a symbolic link to $phys)" ;;
+    esac
+  fi
+  return 0
+}
+
+# True if file $1 holds a NUL byte: not text, and not safe to load in bash
+is_binary() {
+  local all text
+  all=$(wc -c <"$1" 2>/dev/null) || return 1
+  text=$(tr -d '\0' <"$1" 2>/dev/null | wc -c) || return 1
+  (( all != text ))
+}
+
+# One line on the terminal saying what a file or web tool is about to do
+tool_line() {
+  if (( SUB )); then printf '\033[2m[%s] %s\033[0m\n' "$SUB_NAME" "$1" >&2
+  else printf '\n\033[33m%s\033[0m\n' "$1" >&2; fi
+}
+
+# Shows how file $1 would change into file $2 (at most 80 lines)
+show_diff() {
+  command -v diff >/dev/null 2>&1 || return 0
+  diff -u "$1" "$2" 2>/dev/null | tail -n +3 | head -n 80 |
+    sed -e $'s/^+.*/\033[32m&\033[0m/' -e $'s/^-.*/\033[31m&\033[0m/' >&2 ||
+    true
+}
+
+# read {path, offset?, limit?}: the file with line numbers
+tool_read() {
+  local path off lim total last
+  path=$(jq -r '.path? // empty | strings' <<<"$1")
+  off=$(jq -r '(.offset? // 1) | tonumber? // 1 | floor' <<<"$1") || off=1
+  lim=$(jq -r --argjson d "$READ_LINES" \
+          '(.limit? // $d) | tonumber? // $d | floor' <<<"$1") || lim=$READ_LINES
+  (( off >= 1 )) || off=1
+  (( lim >= 1 )) || lim=$READ_LINES
+  if [[ -z "$path" ]]; then
+    TOOL_OUT='Error: invalid tool arguments; expected JSON like {"path": "..."}.'
+    return 0
+  fi
+  file_target "$path"
+  tool_line "read $path${1:+ (from line $off)}"
+  gate "$FILE_OUTSIDE" "" || return 0
+  if [[ -d "$FILE_PATH" ]]; then
+    TOOL_OUT="Error: $path is a directory. List it with bash: ls -la $path"
+  elif [[ ! -e "$FILE_PATH" ]]; then
+    TOOL_OUT="Error: no such file: $path (looked for $FILE_PATH)"
+  elif [[ ! -r "$FILE_PATH" ]]; then
+    TOOL_OUT="Error: $path cannot be read (permission denied)."
+  elif is_binary "$FILE_PATH"; then
+    TOOL_OUT="$path is a binary file ($(wc -c <"$FILE_PATH" | tr -d ' ')"
+    TOOL_OUT+=" bytes); its content is not shown."
+  else
+    total=$(awk 'END { print NR }' "$FILE_PATH" 2>/dev/null) || total=0
+    if (( total == 0 )); then
+      TOOL_OUT="($path is empty)"
+    elif (( off > total )); then
+      TOOL_OUT="($path has only $total lines)"
+    else
+      awk -v s="$off" -v n="$lim" '
+        NR >= s + n { exit }
+        NR >= s     { printf "%6d\t%s\n", NR, $0 }' "$FILE_PATH" \
+        >"$TMP/read.out" 2>/dev/null || true
+      clip_file "$TMP/read.out"
+      TOOL_OUT="$CLIPPED"
+      last=$((off + lim - 1))
+      if (( last < total )); then
+        TOOL_OUT+=$'\n'"[lines $off-$last of $total; read on with offset"
+        TOOL_OUT+=" $((last + 1))]"
+      fi
+    fi
+  fi
+  return 0
+}
+
+# The checks write and edit share. Returns 1 with TOOL_OUT set if the file
+# must not be changed.
+may_change() {
+  if (( SUB )) || [[ "$MODE" == plan ]]; then
+    TOOL_OUT="Plan mode: file not changed. Only reading is allowed here"
+    if (( SUB )); then TOOL_OUT+="."; else TOOL_OUT+="; /build leaves plan mode."
+    fi
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+    return 1
+  fi
+  if [[ -d "$FILE_PATH" ]]; then
+    TOOL_OUT="Error: $FILE_PATH is a directory."
+    return 1
+  fi
+  return 0
+}
+
+# Puts file $1 in place as FILE_PATH, with the user's own umask. An existing
+# file keeps its permissions (it is overwritten, not replaced).
+put_file() {
+  local err
+  if ! err=$( { umask "$ORIG_UMASK"
+                mkdir -p "${FILE_PATH%/*}" && cat "$1" >"$FILE_PATH"; } 2>&1 )
+  then
+    TOOL_OUT="Error: could not write $FILE_PATH: ${err:-unknown error}"
+    return 1
+  fi
+  return 0
+}
+
+# write {path, content}: creates the file or replaces all of it
+tool_write() {
+  local path lines
+  path=$(jq -r '.path? // empty | strings' <<<"$1")
+  if [[ -z "$path" ]] || ! jq -e '.content? | type == "string"' <<<"$1" \
+       >/dev/null 2>&1; then
+    TOOL_OUT='Error: invalid tool arguments; expected JSON like'
+    TOOL_OUT+=' {"path": "...", "content": "..."}.'
+    return 0
+  fi
+  jq -j '.content' <<<"$1" >"$TMP/arg.content"
+  file_target "$path"
+  lines=$(awk 'END { print NR }' "$TMP/arg.content")
+  if [[ -e "$FILE_PATH" ]]; then tool_line "write $path ($lines lines, replaces it)"
+  else tool_line "write $path ($lines lines, new file)"; fi
+  may_change || return 0
+  gate "$FILE_OUTSIDE" "" || return 0
+  if (( ! SUB )); then
+    if [[ -f "$FILE_PATH" ]] && ! is_binary "$FILE_PATH"; then
+      show_diff "$FILE_PATH" "$TMP/arg.content"
+    else
+      head -n 20 "$TMP/arg.content" | sed $'s/^.*$/\033[32m+&\033[0m/' >&2
+      if (( lines > 20 )); then printf '  ... %s more lines\n' $((lines - 20)) >&2
+      fi
+    fi
+  fi
+  if [[ -z "$GATE_OK" ]]; then
+    confirm "Write it?" "to write this file" \
+      "run with -y to approve changes up front" || return 0
+  fi
+  put_file "$TMP/arg.content" || return 0
+  TOOL_OUT="Wrote $path ($lines lines)."
+  return 0
+}
+
+# edit {path, old, new, replace_all?}: replaces text that must match exactly
+tool_edit() {
+  local path all content old new rest count
+  path=$(jq -r '.path? // empty | strings' <<<"$1")
+  all=$(jq -r '.replace_all? == true' <<<"$1")
+  if [[ -z "$path" ]] ||
+     ! jq -e '(.old? | type == "string") and (.new? | type == "string")' \
+       <<<"$1" >/dev/null 2>&1; then
+    TOOL_OUT='Error: invalid tool arguments; expected JSON like'
+    TOOL_OUT+=' {"path": "...", "old": "...", "new": "..."}.'
+    return 0
+  fi
+  jq -j '.old' <<<"$1" >"$TMP/arg.old"
+  jq -j '.new' <<<"$1" >"$TMP/arg.new"
+  file_target "$path"
+  tool_line "edit $path"
+  may_change || return 0
+  gate "$FILE_OUTSIDE" "" || return 0
+  if [[ ! -f "$FILE_PATH" ]]; then
+    TOOL_OUT="Error: no such file: $path. Use write to create a file."
+    return 0
+  fi
+  if is_binary "$FILE_PATH"; then
+    TOOL_OUT="Error: $path is a binary file; edit cannot change it."
+    return 0
+  fi
+  # read -d '' takes the whole file, trailing newlines included (a plain
+  # $(...) would drop them)
+  IFS= read -r -d '' content <"$FILE_PATH" || true
+  IFS= read -r -d '' old <"$TMP/arg.old" || true
+  IFS= read -r -d '' new <"$TMP/arg.new" || true
+  if [[ -z "$old" ]]; then
+    TOOL_OUT="Error: old is empty. Give the exact text to replace, or use"
+    TOOL_OUT+=" write to replace the whole file."
+    return 0
+  fi
+  if [[ "$old" == "$new" ]]; then
+    TOOL_OUT="Error: old and new are the same; nothing to change."
+    return 0
+  fi
+  rest=${content//"$old"/}
+  count=$(( (${#content} - ${#rest}) / ${#old} ))
+  if (( count == 0 )); then
+    TOOL_OUT="Error: old was not found in $path. It must match the file"
+    TOOL_OUT+=" exactly, including spaces, tabs and line breaks. Read the"
+    TOOL_OUT+=" lines again and copy them without the line numbers."
+    return 0
+  fi
+  if (( count > 1 )) && [[ "$all" != true ]]; then
+    TOOL_OUT="Error: old matches $count places in $path. Add surrounding"
+    TOOL_OUT+=" lines to old until it matches one place, or set replace_all"
+    TOOL_OUT+=" to true to change them all."
+    return 0
+  fi
+  if [[ "$all" == true ]]; then content=${content//"$old"/"$new"}
+  else content=${content/"$old"/"$new"}; fi
+  printf '%s' "$content" >"$TMP/edit.new"
+  show_diff "$FILE_PATH" "$TMP/edit.new"
+  if [[ -z "$GATE_OK" ]]; then
+    confirm "Apply it?" "to make this change" \
+      "run with -y to approve changes up front" || return 0
+  fi
+  put_file "$TMP/edit.new" || return 0
+  if (( count == 1 )); then TOOL_OUT="Edited $path."
+  else TOOL_OUT="Edited $path: $count replacements."; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- web tools
+
+# Turns the HTML in file $1 into plain text on stdout. A text browser does it
+# best; without one, a small awk filter drops scripts, styles and tags.
+html_to_text() {
+  if command -v w3m >/dev/null 2>&1; then
+    w3m -dump -T text/html -cols 100 <"$1" 2>/dev/null && return 0
+  fi
+  if command -v lynx >/dev/null 2>&1; then
+    lynx -dump -stdin -nolist -width=100 <"$1" 2>/dev/null && return 0
+  fi
+  tr '\n\r\t' '   ' <"$1" | sed 's/</\
+</g' | awk '
+    function flush() {
+      gsub(/&nbsp;/, " ", buf); gsub(/&lt;/, "<", buf); gsub(/&gt;/, ">", buf)
+      gsub(/&quot;/, "\"", buf); gsub(/&#39;|&apos;/, "\047", buf)
+      gsub(/&amp;/, "\\&", buf); gsub(/[ ]+/, " ", buf); sub(/^ /, "", buf)
+      if (buf != "") print buf
+      buf = ""
+    }
+    {
+      line = $0
+      if (comment) {
+        i = index(line, "-->")
+        if (!i) next
+        comment = 0; buf = buf substr(line, i + 3); next
+      }
+      if (substr(line, 1, 1) != "<") { buf = buf line; next }
+      if (substr(line, 1, 4) == "<!--") {
+        i = index(line, "-->")
+        if (i) buf = buf substr(line, i + 3); else comment = 1
+        next
+      }
+      gt = index(line, ">")
+      if (!gt) next
+      tag = tolower(substr(line, 2, gt - 2)); text = substr(line, gt + 1)
+      closing = (substr(tag, 1, 1) == "/")
+      name = closing ? substr(tag, 2) : tag
+      sub(/[ \/].*/, "", name)
+      if (skip != "") { if (closing && name == skip) skip = ""; next }
+      if (name ~ /^(script|style|noscript|svg|template)$/) {
+        if (!closing && tag !~ /\/$/) skip = name
+        next
+      }
+      if (name ~ /^(p|div|br|li|tr|h[1-6]|section|article|header|footer|ul|ol|pre|blockquote|table|title|hr|dt|dd)$/) {
+        flush()
+        if (!closing && name ~ /^h[1-6]$/) buf = "# "
+        if (!closing && name == "li") buf = "- "
+      }
+      buf = buf text
+    }
+    END { flush() }'
+}
+
+# web_fetch {url}: the page as text
+tool_web_fetch() {
+  local url meta code ctype
+  url=$(jq -r '.url? // empty | strings' <<<"$1")
+  if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
+    TOOL_OUT='Error: invalid tool arguments; expected JSON like'
+    TOOL_OUT+=' {"url": "https://..."} (http and https only).'
+    return 0
+  fi
+  tool_line "web_fetch $url"
+  confirm "Fetch it?" "to fetch this page" \
+    "run with -y to approve up front" || return 0
+  : >"$TMP/web.body"
+  meta=$(curl -sSL --max-time "$WEB_TIMEOUT" --max-filesize 5000000 \
+           --proto '=http,https' --proto-redir '=http,https' \
+           -A "agent.sh/$VERSION" -o "$TMP/web.body" \
+           -w '%{http_code} %{content_type}' "$url" 2>"$TMP/web.err") || {
+    TOOL_OUT="Error: could not fetch $url: $(head -c 300 "$TMP/web.err")"
+    return 0
+  }
+  code=${meta%% *}; ctype=${meta#* }
+  case "$ctype" in
+    *html*|"")
+      html_to_text "$TMP/web.body" 2>/dev/null | cat -s >"$TMP/web.txt" ;;
+    text/*|*json*|*xml*|*javascript*|*yaml*|*toml*)
+      tr -d '\0' <"$TMP/web.body" >"$TMP/web.txt" ;;
+    *)
+      TOOL_OUT="$url is not text ($ctype,"
+      TOOL_OUT+=" $(wc -c <"$TMP/web.body" | tr -d ' ') bytes); not shown."
+      return 0 ;;
+  esac
+  clip_file "$TMP/web.txt"
+  TOOL_OUT="${CLIPPED:-(the page has no text)}"
+  if [[ "$code" != 2* ]]; then
+    TOOL_OUT="[HTTP $code]"$'\n'"$TOOL_OUT"
+  fi
+  return 0
+}
+
+# Decodes %XX and + in $1 (a URL query value) to stdout
+url_decode() { local s=${1//+/ }; printf '%b' "${s//%/\\x}"; }
+
+# Reads a DuckDuckGo HTML result page in file $1; prints title, URL and
+# snippet, one tab-separated result per line
+ddg_parse() {
+  local line href title n=0
+  while IFS= read -r line; do
+    case "$line" in
+      *result__a*)
+        href=$(sed -n 's/.*href="\([^"]*\)".*/\1/p' <<<"$line")
+        title=$(sed -e 's/^[^>]*>//' -e 's/<\/a>.*//' -e 's/<[^>]*>//g' \
+                  <<<"$line" | tr -s ' ')
+        title=${title% }
+        case "$href" in
+          *uddg=*) href=${href#*uddg=}; href=${href%%&*}
+                   href=$(url_decode "$href") ;;
+          //*)     href="https:$href" ;;
+        esac
+        (( n == 0 )) || printf '\n'
+        n=$((n + 1))
+        printf '%s\t%s\t' "$title" "$href" ;;
+      *result__snippet*)
+        (( n > 0 )) || continue
+        sed -e 's/^[^>]*>//' -e 's/<\/a>.*//' -e 's/<[^>]*>//g' <<<"$line" |
+          tr -s ' ' | tr -d '\n' ;;
+    esac
+  done < <(tr '\n\r' '  ' <"$1" | sed 's/<a /\
+<a /g')
+  (( n == 0 )) || printf '\n'
+}
+
+# web_search {query, count?}: titles, URLs and snippets. The backend is the
+# first that is configured: Brave, Tavily, a SearXNG server, else the
+# DuckDuckGo HTML page (no key, but it may refuse automated requests).
+tool_web_search() {
+  local query count q via rows
+  query=$(jq -r '.query? // empty | strings' <<<"$1")
+  count=$(jq -r '(.count? // 5) | tonumber? // 5 | floor' <<<"$1") || count=5
+  (( count >= 1 && count <= 10 )) || count=5
+  if [[ -z "${query//[[:space:]]/}" ]]; then
+    TOOL_OUT='Error: invalid tool arguments; expected JSON like'
+    TOOL_OUT+=' {"query": "..."}.'
+    return 0
+  fi
+  tool_line "web_search $query"
+  confirm "Search for it?" "to run this search" \
+    "run with -y to approve up front" || return 0
+  q=$(jq -rn --arg q "$query" '$q | @uri')
+  : >"$TMP/web.body"; : >"$TMP/web.err"
+  if [[ -n "$BRAVE_KEY" ]]; then
+    via="Brave"
+    printf 'X-Subscription-Token: %s\n' "$BRAVE_KEY" >"$TMP/web.hdr"
+    curl -sS --max-time "$WEB_TIMEOUT" -H @"$TMP/web.hdr" \
+      -H 'Accept: application/json' -o "$TMP/web.body" \
+      "$BRAVE_URL?q=$q&count=$count" 2>"$TMP/web.err" || true
+    rows=$(jq -r '.web.results[]? | [.title, .url, (.description // "")]
+                  | map(gsub("<[^>]*>"; "") | gsub("\\s+"; " ")) | @tsv' \
+             "$TMP/web.body" 2>/dev/null) || rows=""
+  elif [[ -n "$TAVILY_KEY" ]]; then
+    via="Tavily"
+    printf 'Authorization: Bearer %s\n' "$TAVILY_KEY" >"$TMP/web.hdr"
+    jq -cn --arg q "$query" --argjson n "$count" \
+      '{query: $q, max_results: $n}' |
+      curl -sS --max-time "$WEB_TIMEOUT" -H @"$TMP/web.hdr" \
+        -H 'Content-Type: application/json' -o "$TMP/web.body" -d @- \
+        "$TAVILY_URL" 2>"$TMP/web.err" || true
+    rows=$(jq -r '.results[]? | [.title, .url, (.content // "")]
+                  | map(gsub("\\s+"; " ")) | @tsv' \
+             "$TMP/web.body" 2>/dev/null) || rows=""
+  elif [[ -n "$SEARXNG_URL" ]]; then
+    via="SearXNG"
+    curl -sS --max-time "$WEB_TIMEOUT" -o "$TMP/web.body" \
+      "${SEARXNG_URL%/}/search?q=$q&format=json" 2>"$TMP/web.err" || true
+    rows=$(jq -r '.results[]? | [.title, .url, (.content // "")]
+                  | map(gsub("\\s+"; " ")) | @tsv' \
+             "$TMP/web.body" 2>/dev/null) || rows=""
+  else
+    via="DuckDuckGo"
+    curl -sSL --max-time "$WEB_TIMEOUT" -o "$TMP/web.body" \
+      -A 'Mozilla/5.0 (X11; Linux x86_64) agent.sh' \
+      "$DDG_URL?q=$q" 2>"$TMP/web.err" || true
+    rows=$(ddg_parse "$TMP/web.body" 2>/dev/null) || rows=""
+  fi
+  rm -f "$TMP/web.hdr"
+  if [[ -z "$rows" ]]; then
+    TOOL_OUT="No results from $via for: $query."
+    if [[ -s "$TMP/web.err" ]]; then
+      TOOL_OUT+=" ($(head -c 200 "$TMP/web.err" | tr '\n' ' '))"
+    fi
+    if [[ "$via" == DuckDuckGo ]]; then
+      TOOL_OUT+=" The keyless search may have refused the request; the user"
+      TOOL_OUT+=" can set BRAVE_API_KEY, TAVILY_API_KEY or SEARXNG_URL."
+    fi
+    return 0
+  fi
+  TOOL_OUT=$(head -n "$count" <<<"$rows" |
+    awk -F'\t' '{ printf "%d. %s\n   %s\n", NR, $1, $2
+                  if ($3 != "") printf "   %s\n", $3 }')
+  return 0
+}
+
+# Runs file or web tool $1 with the arguments $2 (a JSON object); the result
+# goes in TOOL_OUT. fd 9 is the terminal, or nowhere for an explorer.
+other_tool() {
+  if (( SUB )); then exec 9>/dev/null; else exec 9>&2; fi
+  ensure_tmp
+  TOOL_OUT=""
+  "tool_$1" "$2" || true
+  exec 9>&-
+  [[ -n "$TOOL_OUT" ]] || TOOL_OUT="(no output)"
+}
+
 # ---------------------------------------------------------------- explorers
 
 # An explorer is this script again, started with AGENT_SUB=1: plan mode (the
@@ -1736,7 +2375,7 @@ sub_start() {
     export AGENT_SUB=1 AGENT_SUB_NAME="explorer $n" AGENT_API_KEY="$API_KEY"
     export MODEL PROVIDER URL REASONING THINKING TEMPERATURE MAX_OUT TIMEOUT
     export CMD_TIMEOUT SUB_MAX_STEPS PROJECT_DOC AUTO_COMPACT COMPACT_AT
-    export OUTSIDE WORKSPACE ALLOW_PATHS ASK_CMDS
+    export OUTSIDE WORKSPACE ALLOW_PATHS ASK_CMDS READ_LINES
     export SESSION_DIR="$SUB_DIR/sessions" AGENT_HISTFILE=/dev/null
     export SHOW_REASONING=0
     if [[ -n "$PROMPT_DIR" ]]; then export PROMPT_DIR; fi
@@ -1813,13 +2452,12 @@ abort_turn() {
 # The arguments of a tool call as an object: normally a JSON *string*, but some
 # backends send an object
 ARG='(.function.arguments | if type == "string" then fromjson? else . end)'
-TOOL_NAMES=$(jq -r '[.[].function.name] | join(", ")' <<<"$TOOLS")
 
 # One user turn: call the model, run its tools, repeat until it stops.
 # TURN_OK is 0 afterwards if the turn failed or was interrupted.
 TURN_OK=1
 run_turn() {
-  local result msg call id name cmd out n ncalls steps=0
+  local result msg call id name cmd out n ncalls steps=0 args
   TURN_OK=1
   while true; do
     INTERRUPTED=0
@@ -1886,6 +2524,8 @@ run_turn() {
       id=$(jq -r '.id' <<<"$call")
       name=$(jq -r '.function.name' <<<"$call")
       cmd=$(jq -r "$ARG"' | .command? // empty' <<<"$call")
+      args=$(jq -c "$ARG"' | objects // {}' <<<"$call" 2>/dev/null) || args='{}'
+      [[ -n "$args" ]] || args='{}'
       if (( INTERRUPTED )); then
         sub_kill_all
         out="Skipped: the user interrupted."
@@ -1899,9 +2539,12 @@ run_turn() {
           out+=' {"task": "..."}.'
           printf '%s\n' "$out" >&2
         fi
-      elif [[ "$name" != "bash" ]]; then
+      elif [[ ", $TOOL_NAMES, " != *", $name, "* ]]; then
         out="Error: unknown tool '$name'. The tools are: $TOOL_NAMES."
         printf '%s\n' "$out" >&2
+      elif [[ "$name" != bash ]]; then      # read, write, edit, web_*
+        other_tool "$name" "$args"
+        out="$TOOL_OUT"
       elif [[ -z "$cmd" ]]; then
         out='Error: invalid tool arguments; expected JSON like'
         out+=' {"command": "..."}.'
@@ -2099,10 +2742,31 @@ while true; do
                  "confirmation (now: $AUTO)"
             echo "/plan            plan only: read-only commands, no edits"
             echo "/build           leave plan mode and allow edits again"
-            echo "/exit            quit (or Ctrl-D)" ;;
-    *) auto_compact          # must run before the new message joins the history
-       append "$(printf '%s' "$input" | jq -cRs '{role: "user", content: .}')"
-       run_turn ;;
+            echo "/exit            quit (or Ctrl-D)"
+            cmds=$(list_commands)
+            if [[ -n "$cmds" ]]; then
+              echo
+              echo "Prompt commands (text after the name is passed along):"
+              printf '%s\n' "$cmds"
+            fi ;;
+    *) # /name [text] runs a prompt command; "/usr/bin is broken" is a message
+       if [[ "$input" =~ ^/([A-Za-z][A-Za-z0-9_-]*)([[:space:]]+(.*))?$ ]]; then
+         if find_command "${BASH_REMATCH[1]}"; then
+           printf '\033[2m(/%s: %s)\033[0m\n' "${BASH_REMATCH[1]}" \
+             "$CMD_FILE" >&2
+           input=$(render_command "$CMD_FILE" "${BASH_REMATCH[3]:-}")
+         else
+           echo "Unknown command /${BASH_REMATCH[1]} (try /help)." >&2
+           TURN_OK=0
+           input=""
+         fi
+       fi
+       if [[ -n "$input" ]]; then
+         auto_compact        # must run before the new message joins the history
+         append "$(printf '%s' "$input" |
+                   jq -cRs '{role: "user", content: .}')"
+         run_turn
+       fi ;;
   esac
   input=""
   if (( ONESHOT )); then break; fi
