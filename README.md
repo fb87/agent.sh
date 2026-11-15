@@ -191,6 +191,22 @@ A file `commands/NAME.md` in a prompt directory adds a prompt command:
 the description `/help` shows next to it. `{{args}}` is replaced by the text
 after the name; when the file has no `{{args}}`, that text is appended.
 
+These prompt commands are bundled; a file of the same name in your own prompt
+directory replaces one:
+
+| Command | Purpose |
+| --- | --- |
+| `/review [what]` | review the uncommitted changes, or a commit, branch or path |
+| `/security [what]` | look for security problems in the changes or a path |
+| `/explain [what]` | explain a file, a function or the whole project |
+| `/debug problem` | find the cause of a problem without changing code |
+| `/fix [problem]` | reproduce a bug or failing command, then fix it |
+| `/test [what]` | write tests in the project's own style |
+| `/refactor [what]` | simplify code without changing what it does |
+| `/docs [what]` | bring the documentation in line with the code |
+| `/commit` | commit the current changes with a fitting message |
+| `/init` | write an `AGENTS.md` for the project |
+
 On the first run, `agent.sh` creates `$XDG_CONFIG_HOME/agent.sh/prompts/` and
 copies the bundled prompts into it as `NAME.md.example`. Rename one to
 `NAME.md` to override that prompt; the `.example` files themselves never

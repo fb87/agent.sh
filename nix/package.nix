@@ -33,8 +33,8 @@ stdenv.mkDerivation {
     install -Dm755 agent.sh "$out/libexec/agent.sh"
     # The script looks for pro.mpts beside itself, after the user's prompts
     # in $XDG_CONFIG_HOME/agent.sh/prompts.
-    for f in pro.mpts/*.md; do
-      install -Dm644 "$f" "$out/libexec/pro.mpts/$(basename "$f")"
+    for f in pro.mpts/*.md pro.mpts/commands/*.md; do
+      install -Dm644 "$f" "$out/libexec/$f"
     done
 
     makeWrapper "$out/libexec/agent.sh" "$out/bin/agent.sh" \

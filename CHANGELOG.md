@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bundled prompt commands: `/review`, `/security`, `/explain`, `/debug`,
+  `/fix`, `/test`, `/refactor`, `/docs`, `/commit` and `/init` (writes an
+  `AGENTS.md`). A file of the same name in your own prompt directory
+  replaces one.
+- Bundled `PLAN.md` and `EXPLORE.md`, so every prompt has a file to copy and
+  adjust.
+
+### Fixed
+
+- The Nix package installs `pro.mpts/commands/`.
+
 ## [0.4.0] - 2026-11-15
 
 ### Added
