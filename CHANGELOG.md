@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
 ### Added
 
 - Bundled prompt commands: `/review`, `/security`, `/explain`, `/debug`,
@@ -273,7 +275,8 @@ OpenAI-compatible endpoint (OpenCode Go).
 - Model output is trusted as JSON only as far as the API guarantees it; a
   malformed stream aborts the turn rather than being repaired.
 
-[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fb87/agent.sh/releases/tag/v0.5.0
 [0.4.0]: https://github.com/fb87/agent.sh/releases/tag/v0.4.0
 [0.3.0]: https://github.com/fb87/agent.sh/releases/tag/v0.3.0
 [0.2.0]: https://github.com/fb87/agent.sh/releases/tag/v0.2.0

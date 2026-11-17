@@ -111,12 +111,11 @@ set -euo pipefail
 # to the empty string, which matters for REASONING and friends.
 MODEL_ENV_SET=${MODEL+1};              MODEL_ENV="${MODEL-}"
 PROVIDER_ENV_SET=${PROVIDER+1};        PROVIDER_ENV="${PROVIDER-}"
-URL_ENV_SET=${URL+1};                  URL_ENV="${URL-}"
+URL_ENV="${URL-}"
 REASONING_ENV_SET=${REASONING+1};      REASONING_ENV="${REASONING-}"
 THINKING_ENV_SET=${THINKING+1};        THINKING_ENV="${THINKING-}"
 TEMPERATURE_ENV_SET=${TEMPERATURE+1};  TEMPERATURE_ENV="${TEMPERATURE-}"
 CONTEXT_ENV_SET=${CONTEXT+1};          COMPACT_AT_ENV_SET=${COMPACT_AT:+1}
-AGENT_API_KEY_ENV_SET=${AGENT_API_KEY+1}
 AGENT_API_KEY_ENV="${AGENT_API_KEY-}"
 # The key stays in this shell only: commands the model runs must not inherit
 # it (an "env" would put it in the transcript and send it to the provider).
@@ -124,7 +123,9 @@ BRAVE_KEY="${BRAVE_API_KEY-}"
 TAVILY_KEY="${TAVILY_API_KEY-}"
 # The key each built-in provider takes from the environment (ENVKEY_<name>)
 ENVKEY_opencode="${OPENCODE_API_KEY-}"
+# shellcheck disable=SC2034  # read indirectly through ENVKEY_<provider>
 ENVKEY_openai="${OPENAI_API_KEY-}"
+# shellcheck disable=SC2034  # read indirectly through ENVKEY_<provider>
 ENVKEY_openrouter="${OPENROUTER_API_KEY-}"
 COPILOT_ENV_TOKEN="${COPILOT_GITHUB_TOKEN-}"
 unset AGENT_API_KEY OPENCODE_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY \
@@ -221,7 +222,7 @@ COPILOT_EDITOR="${COPILOT_EDITOR:-vscode/1.99.3}"
 COPILOT_PLUGIN="${COPILOT_PLUGIN:-copilot-chat/0.26.7}"
 CONFIG_LOADED=0
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 RELEASED="2026-11-13"
 AUTHOR="fb87"                                       # see LICENSE
 
@@ -417,8 +418,8 @@ load_plugins() {
     fi
     PLUGIN_CURRENT="${f##*/}"
     PLUGIN_FILES+="$f"$'\n'
-    # shellcheck disable=SC1090
     set +u
+    # shellcheck disable=SC1090  # plugin path is only known at run time
     if ! . "$f"; then plugin_warn "stopped with an error while loading"; fi
     set -u
   done <<<"$list"
@@ -495,7 +496,7 @@ plugin_command_match() {
 
 # /plugins: what is loaded and what each file added
 plugin_info() {
-  local f n t any=0 line h
+  local f n t line h
   if [[ -z "$PLUGIN_FILES" ]]; then
     printf 'No plugins. Put *.sh files in %s/plugins (see the README).\n' \
       "$CONFIG_DIR"
@@ -1250,7 +1251,7 @@ list_sessions() {
   return 0
 }
 
-usage() { sed -n '6,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
+usage() { sed -n '7,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
 
 # The current model settings (REPL: /model or /model info)
 model_info() {
@@ -1452,7 +1453,7 @@ model_use() {
 
 # Version and environment details (REPL: /about, CLI: -V or --version)
 about() {
-  local jq_ver curl_ver run cfg_note=""
+  local jq_ver curl_ver run cfg_note="" f plugins=""
   jq_ver=$(jq --version 2>/dev/null); jq_ver=${jq_ver/jq-/jq }
   curl_ver=$(curl --version 2>/dev/null | head -1 | cut -d' ' -f1,2)
   if [[ "$AUTO" == 1 ]]; then run="run without asking"; else run="ask first"; fi
@@ -1497,8 +1498,10 @@ about() {
       "$( [[ "$CLI_HINTS" == 0 ]] && echo ' (not suggested: CLI_HINTS=0)')"
   fi
   if [[ -n "$PLUGIN_FILES" ]]; then
-    printf '  %-9s %s\n' plugins \
-      "$(sed 's|.*/||' <<<"$PLUGIN_FILES" | tr '\n' ' ')"
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && plugins+="${f##*/} "
+    done <<<"$PLUGIN_FILES"
+    printf '  %-9s %s\n' plugins "$plugins"
   fi
   if (( WEB )); then
     if [[ -n "$BRAVE_KEY" ]]; then printf '  %-9s Brave\n' search

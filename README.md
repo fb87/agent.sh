@@ -1,8 +1,10 @@
 # agent.sh
 
 A coding agent in a single bash file. One script, `jq` and `curl`; it talks to
-an OpenAI-compatible chat-completions endpoint and can inspect, edit and run
-things in the current directory.
+OpenAI-compatible chat-completions endpoints — OpenCode Go by default, with
+GitHub Copilot, OpenAI, OpenRouter and Ollama built in — and can inspect, edit
+and run things in the current directory. Shell plugins can add commands, tools,
+providers and hooks.
 
 ```sh
 ./agent.sh                 # REPL
