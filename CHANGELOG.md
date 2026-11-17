@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `todo` tool and `/todo` command: the model keeps a plan for a task
+  with several steps as a list of pending, in progress and done items. The
+  list is shown as it changes, saved with the session and carried through
+  compaction; `/todo` (or `/todo clear`) shows or clears it.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added

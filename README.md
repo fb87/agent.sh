@@ -242,6 +242,11 @@ requests. `WEB=0` removes both tools, and `WEB_TIMEOUT` bounds one fetch or
 search. The keys can also be `brave_api_key`, `tavily_api_key` and
 `searxng_url` in the config file.
 
+The `todo` tool lets the model keep a plan for a task with several steps: a
+list of items, each pending, in progress or done. The list is shown as it
+changes, saved with the session and carried through compaction, so a long
+task survives a summary. `/todo` shows it.
+
 When `rg`, `fd`/`fdfind`, `fzf`, `ast-grep` or `tree` is installed, the system
 prompt tells the model to use it in place of `grep -r` or `find`: `rg PATTERN`
 instead of `grep -r`, `fd` instead of `find`, `fzf --filter TEXT` (never
@@ -344,13 +349,13 @@ A plugin tool that is not `ro` asks for confirmation like a command (unless
 run hooks. `/plugins` lists the files loaded and what each added; `/help`
 lists plugin commands next to the built-in ones.
 
-A small plugin in `~/.config/agent.sh/plugins/todo.sh`:
+A small plugin in `~/.config/agent.sh/plugins/todos.sh`:
 
 ```sh
-agent_tool todo "list the TODO comments in the project" \
+agent_tool todos "list the TODO comments in the project" \
   '{"type": "object", "properties": {}}' ro
 
-tool_todo() {
+tool_todos() {
   rg -n 'TODO' . || true
 }
 
@@ -378,6 +383,8 @@ cmd_stamp() {
 | `/context <tokens\|default>` | set the window in tokens (`default`: unset) |
 | `/context compact <bytes\|default>` | set the compaction threshold itself |
 | `/plugins` | list the plugin files and what each one added |
+| `/todo` | show the model's todo list for this session |
+| `/todo clear` | clear the todo list |
 | `/compact` | summarize the history (also automatic past `COMPACT_AT`) |
 | `/sessions [all]` | list saved sessions |
 | `/resume ID` | switch to a session by id or unique prefix |

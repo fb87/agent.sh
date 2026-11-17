@@ -42,6 +42,8 @@
 # Plugins: *.sh files in $XDG_CONFIG_HOME/agent.sh/plugins (and AGENT_PLUGINS)
 # are sourced at startup and add commands, tools, providers and hooks;
 # /plugins lists them, AGENT_PLUGINS=none loads none (README, "Plugins").
+# The todo tool lets the model keep a plan for a longer task; it is shown as
+# it changes, kept with the session and through compaction (/todo shows it).
 # rg, fd (fdfind), fzf, ast-grep and tree, when installed, are suggested to
 # the model in place of grep -r and find; CLI_HINTS=0 turns that off.
 # Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
@@ -206,6 +208,7 @@ API_KEY_SOURCE=""
 PKIND="plain"                          # opencode, copilot, local or plain
 URL_FIXED=0                            # 1 = the user chose this endpoint
 RESP_MODELS="${AGENT_RESPONSES_MODELS-}"  # models that need /responses
+TODOS='[]'                             # the model's todo list (JSON)
 # GitHub Copilot: a sign-in token is exchanged for a short-lived session
 # token (API_KEY) that expires at COPILOT_EXP (epoch seconds). The client id
 # is the public one of the Copilot plugin for Vim/Neovim. The URLs can be
@@ -282,8 +285,8 @@ PLUGIN_ERR=""
 AGENT_PROMPT=""
 PLUGIN_BUILTIN_COMMANDS=" help about model provider login compact context"
 PLUGIN_BUILTIN_COMMANDS+=" sessions resume reset auto plan build exit quit"
-PLUGIN_BUILTIN_COMMANDS+=" plugins "
-PLUGIN_BUILTIN_TOOLS=" bash read write edit web_search web_fetch explore "
+PLUGIN_BUILTIN_COMMANDS+=" plugins todo "
+PLUGIN_BUILTIN_TOOLS=" bash read write edit web_search web_fetch explore todo "
 PLUGIN_BUILTIN_PROVIDERS=" opencode opencode-go copilot github-copilot openai"
 PLUGIN_BUILTIN_PROVIDERS+=" openrouter ollama "
 PLUGIN_EVENTS=" start turn_start turn_end exit tool_call "
@@ -1895,6 +1898,23 @@ TOOLS=$(jq -cn --argjson explore "$SUBAGENTS" --argjson web "$WEB" \
      {url: {type: "string", description: "The full URL"}};
      ["url"])]
   else [] end)
+  + (if $sub == 1 then [] else
+  [tool("todo";
+     "Keep a todo list for a task with several steps (three or more), so "
+     + "you and the user can see the plan and the progress. Send the whole "
+     + "list every time: it replaces the old one. Keep one item "
+     + "in_progress at a time, mark it done as soon as it is finished, and "
+     + "add, drop or reword items as the plan changes. Skip it for a "
+     + "quick question or a one-step change.";
+     {items: {type: "array", description: "The complete list, in order",
+              items: {type: "object",
+                      properties: {
+                        text: {type: "string",
+                               description: "What to do, one short line"},
+                        status: {type: "string",
+                                 enum: ["pending", "in_progress", "done"]}},
+                      required: ["text", "status"]}}};
+     ["items"])] end)
   + (if $explore == 1 then
   [tool("explore";
      "Start a read-only sub-agent that explores the project and returns a "
@@ -1991,8 +2011,9 @@ save_session() {
   LAST_SETTINGS="$settings"
   [[ -d "$SESSION_DIR" ]] || mkdir -p "$SESSION_DIR" 2>/dev/null || true
   if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" \
-         --argjson settings "$settings" \
-         '{id: $id, cwd: $cwd, settings: $settings, messages: .}' \
+         --argjson settings "$settings" --argjson todos "$TODOS" \
+         '{id: $id, cwd: $cwd, settings: $settings, todos: $todos,
+           messages: .}' \
          <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null ||
      ! mv -f "$f.$$.tmp" "$f"; then
     echo "warning: could not save session to $f" >&2
@@ -2000,6 +2021,7 @@ save_session() {
 }
 
 new_history() {
+  TODOS='[]'
   MESSAGES=$(jq -cn --arg s "$SYSTEM" '[{role: "system", content: $s}]')
 }
 
@@ -2166,6 +2188,15 @@ load_session() {
   fi
   MESSAGES="$msgs"
   SESSION_ID="$id"
+  # the list as saved, if it is the shape the todo tool writes
+  TODOS=$(jq -c '.todos // [] | if type == "array" then
+      [.[] | objects | select((.text | type) == "string")
+       | {text: (.text | gsub("[\u0000-\u001f\u007f-\u009f]+"; " ")
+                | .[:300]), status: (.status
+          | if IN("pending", "in_progress", "done") then . else "pending"
+            end)}] else [] end' "$SESSION_DIR/$id.json" 2>/dev/null) ||
+    TODOS='[]'
+  [[ -n "$TODOS" ]] || TODOS='[]'
   n=$(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES")
   echo "Resumed session $SESSION_ID ($n user messages)" >&2
   restore_settings "${2:-}"
@@ -2590,6 +2621,10 @@ compact() {
   # Folded mid-turn with nothing kept, the history would end on the summary
   # and a failed request would then drop it as an unsent message: end on a
   # short instruction instead.
+  if [[ "$TODOS" != "[]" ]]; then
+    summary+=$'\n\n'"Your todo list at that point (update it with the todo"
+    summary+=" tool):"$'\n'"$(todo_text)"
+  fi
   folded=$(jq -c --arg s "$SYSTEM" --arg sum "$summary" --arg when "$when" '
       [{role: "system", content: $s},
        {role: "user",
@@ -3740,6 +3775,66 @@ other_tool() {
   [[ -n "$TOOL_OUT" ]] || TOOL_OUT="(no output)"
 }
 
+# ---------------------------------------------------------------- todo list
+
+# The model's plan for a longer task: a list of {text, status} it rewrites
+# whole with the todo tool. It is shown as it changes, saved with the
+# session and carried through compaction. /todo shows it. TODOS is set at
+# the top, before a resumed session fills it.
+
+# The list as text: [x] done, [>] in progress, [ ] pending
+todo_text() {
+  jq -r '.[] | (if .status == "done" then "[x] "
+                elif .status == "in_progress" then "[>] "
+                else "[ ] " end) + .text' <<<"$TODOS"
+}
+
+# The list on the screen, the item in progress in bold, done ones dim
+todo_show() {
+  local n
+  n=$(jq length <<<"$TODOS")
+  if (( n == 0 )); then echo "The todo list is empty."; return 0; fi
+  jq -r '.[] | if .status == "done" then "\u001b[2m  [x] " + .text
+               elif .status == "in_progress" then "\u001b[1m  [>] " + .text
+               else "  [ ] " + .text end + "\u001b[0m"' <<<"$TODOS"
+}
+
+# todo {items: [{text, status}]}: replaces the list
+tool_todo() {
+  local list err n done_n
+  err=$(jq -r '
+    if (.items | type) != "array" then "items must be an array"
+    elif (.items | length) > 50 then "at most 50 items"
+    elif any(.items[]; (type != "object") or ((.text | type) != "string")
+             or ((.text | gsub("\\s"; "")) == "")) then
+      "every item needs a non-empty text"
+    elif any(.items[]; (.status // "pending")
+             | IN("pending", "in_progress", "done") | not) then
+      "status must be pending, in_progress or done"
+    else empty end' <<<"$1" 2>/dev/null) || err="the arguments are not JSON"
+  if [[ -n "$err" ]]; then
+    TOOL_OUT="Error: $err. Expected JSON like {\"items\": [{\"text\": "
+    TOOL_OUT+="\"...\", \"status\": \"pending|in_progress|done\"}]}."
+    return 0
+  fi
+  # no control characters: an item is printed as it is
+  list=$(jq -c '[.items[] | {text: (.text
+                                     | gsub("[\u0000-\u001f\u007f-\u009f]+";
+                                            " ") | .[:300]),
+                             status: (.status // "pending")}]' <<<"$1")
+  TODOS="$list"
+  save_session
+  n=$(jq length <<<"$TODOS")
+  done_n=$(jq '[.[] | select(.status == "done")] | length' <<<"$TODOS")
+  if (( SUB )); then :
+  else
+    printf '\n\033[33mtodo (%s of %s done)\033[0m\n' "$done_n" "$n" >&2
+    todo_show >&2
+  fi
+  TOOL_OUT="Todo list updated ($done_n of $n done):"$'\n'"$(todo_text)"
+  if (( n == 0 )); then TOOL_OUT="Todo list cleared."; fi
+}
+
 # ---------------------------------------------------------------- explorers
 
 # An explorer is this script again, started with AGENT_SUB=1: plan mode (the
@@ -4196,7 +4291,8 @@ while true; do
                  "confirmation (now: $AUTO)"
             echo "/plan            plan only: read-only commands, no edits"
             echo "/build           leave plan mode and allow edits again"
-            echo "/plugins             loaded plugins and what they added"
+            echo "/todo [clear]    the model's todo list for this session"
+            echo "/plugins         loaded plugins and what they added"
             echo "/exit            quit (or Ctrl-D)"
             if [[ -n "$PLUGIN_COMMAND_HELP" ]]; then
               echo
@@ -4212,6 +4308,9 @@ while true; do
               printf '%s\n' "$cmds"
             fi ;;
     /plugins) plugin_info ;;
+    /todo)  todo_show ;;
+    "/todo clear") TODOS='[]'; save_session; echo "Todo list cleared." ;;
+    "/todo "*) echo "Usage: /todo [clear]" ;;
     *) # /name [text] runs a prompt command; "/usr/bin is broken" is a message
        if plugin_command_match "$input"; then
          AGENT_PROMPT=""
