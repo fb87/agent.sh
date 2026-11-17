@@ -384,6 +384,8 @@ cmd_stamp() {
 | `/plugins` | list the plugin files and what each one added |
 | `/todo` | show the model's todo list for this session |
 | `/todo clear` | clear the todo list |
+| `/btw <question>` | ask on the side: answered from the conversation so far, but not added to it |
+| `/btw! <question>` | the same without the conversation, for a question of its own |
 | `/compact` | summarize the history (also automatic past `COMPACT_AT`) |
 | `/sessions [all]` | list saved sessions |
 | `/resume ID` | switch to a session by id or unique prefix |

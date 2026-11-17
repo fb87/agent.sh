@@ -53,6 +53,7 @@
               bashInteractive
               curl
               jq
+              fzf ripgrep ast-grep fd
               shellcheck
             ];
           };

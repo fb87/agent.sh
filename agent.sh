@@ -21,7 +21,7 @@
 #   prompt   optional first message; the agent answers it and exits (one-shot)
 #            unless -i is given (put -- before a prompt that starts with '-')
 #
-# REPL commands: /help  /about  /model  /compact  /sessions [all]
+# REPL commands: /help  /about  /model  /compact  /sessions [all]  /btw
 #                /resume ID  /reset  /auto  /plan  /build  /exit (Ctrl-D)
 # /model shows the model, reasoning effort, thinking and temperature;
 # /model set temperature 0.1 (or reasoning medium, thinking off) changes one
@@ -42,6 +42,7 @@
 # Plugins: *.sh files in $XDG_CONFIG_HOME/agent.sh/plugins (and AGENT_PLUGINS)
 # are sourced at startup and add commands, tools, providers and hooks;
 # /plugins lists them, AGENT_PLUGINS=none loads none (README, "Plugins").
+# /btw QUESTION asks on the side: the answer is not kept in the history.
 # The todo tool lets the model keep a plan for a longer task; it is shown as
 # it changes, kept with the session and through compaction (/todo shows it).
 # rg, fd (fdfind), fzf, ast-grep and tree, when installed, are suggested to
@@ -286,7 +287,7 @@ PLUGIN_ERR=""
 AGENT_PROMPT=""
 PLUGIN_BUILTIN_COMMANDS=" help about model provider login compact context"
 PLUGIN_BUILTIN_COMMANDS+=" sessions resume reset auto plan build exit quit"
-PLUGIN_BUILTIN_COMMANDS+=" plugins todo "
+PLUGIN_BUILTIN_COMMANDS+=" plugins todo btw "
 PLUGIN_BUILTIN_TOOLS=" bash read write edit web_search web_fetch explore todo "
 PLUGIN_BUILTIN_PROVIDERS=" opencode opencode-go copilot github-copilot openai"
 PLUGIN_BUILTIN_PROVIDERS+=" openrouter ollama "
@@ -3750,6 +3751,42 @@ tool_todo() {
   if (( n == 0 )); then TOOL_OUT="Todo list cleared."; fi
 }
 
+# /btw QUESTION: a side question about the work, answered from the
+# conversation so far but kept out of it: nothing is added to the history
+# or the session, and no tools are offered. /btw! asks without the history.
+BTW_NOTE='(A side question from the user. Answer it briefly from what you '
+BTW_NOTE+='already know; you have no tools for it. It is not kept in the '
+BTW_NOTE+='conversation, so do not change the plan or the task because of it.)'
+btw() {
+  local bare="$1" q="$2" msgs result msg
+  q=${q#"${q%%[![:space:]]*}"}
+  if [[ -z "${q//[[:space:]]/}" ]]; then
+    echo "Usage: /btw <question>  (/btw! <question> leaves the history out)"
+    return 0
+  fi
+  INTERRUPTED=0
+  if (( bare )); then
+    msgs=$(jq -cn --arg s "$SYSTEM" --arg q "$q" \
+      '[{role: "system", content: $s}, {role: "user", content: $q}]')
+  else
+    msgs=$(printf '%s' "$MESSAGES" | jq -c --arg q "$BTW_NOTE"$'\n\n'"$q" \
+      "$REPAIR"' + [{role: "user", content: $q}]') || return 0
+  fi
+  printf '\033[2m(btw: not kept in the conversation)\033[0m\n' >&2
+  request "$msgs" notools
+  if (( INTERRUPTED )); then INTERRUPTED=0; echo; return 0; fi
+  result=$(assemble)
+  if ! msg=$(jq -ce '.message // empty' <<<"$result"); then
+    printf 'API error: %s\n' "$(jq -r '(.error // "(no response)")
+      | if type == "object" then (.message // tojson) else . end' \
+      <<<"$result")" >&2
+    return 0
+  fi
+  if [[ "$(jq -r '.streamed' <<<"$result")" != true ]]; then
+    jq -r '.content // empty' <<<"$msg"
+  fi
+}
+
 # ---------------------------------------------------------------- explorers
 
 # An explorer is this script again, started with AGENT_SUB=1: plan mode (the
@@ -4155,6 +4192,8 @@ while true; do
     "/model "*) echo "Usage: /model [info|list] | /model use <number or"\
                       "name> | /model set <key> <value>" ;;
     /compact) compact || true ;;
+    /btw|"/btw "*) btw 0 "${input#/btw}" ;;
+    "/btw!"|"/btw! "*) btw 1 "${input#/btw!}" ;;
     /reset) SESSION_ID=$(new_id); new_history
             echo "New session $SESSION_ID." ;;
     /auto)  if [[ "$AUTO" == 1 ]]; then
@@ -4191,6 +4230,8 @@ while true; do
                  "sets it in tokens,"
             echo "                 /context compact 200000 sets the byte"\
                  "limit (default resets)"
+            echo "/btw QUESTION    a side question, not kept in the"\
+                 "conversation (/btw! without it)"
             echo "/compact         summarize the conversation to free up"\
                  "context"
             echo "                 (automatic above $COMPACT_AT bytes;"\

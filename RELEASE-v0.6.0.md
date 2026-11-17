@@ -22,6 +22,9 @@ and `curl`.
   as a list of pending, in progress and done items. The list is shown as it
   changes, saved with the session and carried through compaction; `/todo` (or
   `/todo clear`) shows or clears it.
+- **`/btw`.** A side question is answered from the conversation so far, with
+  no tools, and neither question nor answer is added to the history or saved
+  with the session; `/btw!` asks without the history.
 - **Breaking:** endpoints that only serve `/chat/completions`, and models an
   endpoint offers only there, can no longer be used. The per-request fallback
   and the list of models that needed `/responses` went with it, so

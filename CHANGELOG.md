@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with several steps as a list of pending, in progress and done items. The
   list is shown as it changes, saved with the session and carried through
   compaction; `/todo` (or `/todo clear`) shows or clears it.
+- `/btw QUESTION` asks a side question: it is answered from the conversation
+  so far without tools, and neither the question nor the answer is added to
+  the history or saved with the session. `/btw!` asks without the history.
 
 ### Changed
 
