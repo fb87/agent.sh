@@ -15,9 +15,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces one.
 - Bundled `PLAN.md` and `EXPLORE.md`, so every prompt has a file to copy and
   adjust.
+- Plugins: `*.sh` files in `$XDG_CONFIG_HOME/agent.sh/plugins` and in
+  `AGENT_PLUGINS` (colon-separated; `none` loads none) are sourced at startup
+  as trusted code. They add REPL commands (`agent_command`), tools
+  (`agent_tool`, read-only or confirmed before use), providers
+  (`agent_provider`, with optional extra headers and a preparation step) and
+  hooks (`agent_hook`: `start`, `turn_start`, `turn_end`, `exit`,
+  `tool_call`). Built-in names are reserved, plugin commands show up in
+  `/help`, and `/plugins` lists the files and what each one added. A file
+  that is world-writable or owned by another user is not loaded, and a file
+  that fails to load is reported and skipped.
+- Built-in providers `copilot` (GitHub Copilot), `openai`, `openrouter` and
+  `ollama` next to `opencode`; `PROVIDER` picks one, and the new `providers`
+  object in `config.json` sets a model, key or endpoint per provider (and
+  adds a provider of your own).
+- `agent.sh --login copilot` and `/login copilot`: GitHub's device flow signs
+  in and keeps the token in `$XDG_CONFIG_HOME/agent.sh/auth.json` (mode
+  `0600`, directory `0700`). `COPILOT_GITHUB_TOKEN`, or the token of the
+  Copilot plugin for Vim/Neovim, also works.
+- `/provider`, `/provider list` and `/provider use NAME [MODEL]`: show the
+  current provider, model, endpoint and where the key comes from, list which
+  providers are ready, and switch for this run.
+- `/context` shows the context window and the compaction threshold;
+  `/context N` sets the window in tokens and `/context compact BYTES` the
+  threshold (`default` restores the automatic value). `/model set` accepts
+  `context` and `compact_at` too, and a session keeps both.
+- A model that refuses `/chat/completions` and accepts `/responses` is
+  remembered and used from then on; `AGENT_RESPONSES_MODELS` sets the pairs
+  up front, `/about` shows it, and explorers inherit the list.
+- When `rg`, `fd`, `fzf`, `ast-grep` or `tree` is installed, the model is
+  told to use it instead of `grep -r` and `find` (`CLI_HINTS=0` turns the
+  hints off).
+- A session now saves the provider, model, reasoning, thinking, temperature,
+  context and compaction threshold after each turn, and `-c`/`-r` restore
+  them. Keys and URLs are not saved, and values set in the environment for
+  this run are kept.
+
+### Changed
+
+- Each provider has its own default model and reasoning effort. The
+  top-level `model`, `url`, `api_key` and `reasoning` belong to the provider
+  named at startup, so switching never sends one provider's key to another
+  endpoint.
+- A command that names the config directory always asks for approval, even
+  when it is inside the workspace.
 
 ### Fixed
 
+- Switching provider drops the reasoning text of the previous model from the
+  conversation instead of sending it to an endpoint that did not produce it.
 - The Nix package installs `pro.mpts/commands/`.
 
 ## [0.4.0] - 2026-11-15

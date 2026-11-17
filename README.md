@@ -83,29 +83,51 @@ An example user config:
   "api_key": "sk-...",
   "reasoning": "low",
   "thinking": "off",
-  "temperature": 0.2
+  "temperature": 0.2,
+  "providers": {
+    "work": {
+      "url": "https://llm.example.com/v1/chat/completions",
+      "model": "gpt-4.1-mini",
+      "api_key": "sk-work-..."
+    },
+    "openrouter": { "api_key": "sk-or-..." }
+  }
 }
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `provider` | `opencode` | `opencode`/`opencode-go` picks the default endpoint |
-| `model` | `deepseek-v4.1-flash` | model name |
-| `url` | provider's endpoint | full chat-completions URL for any provider |
+| `provider` | `opencode` | provider to use (see [Providers](#providers)) |
+| `model` | the provider's default | model name |
+| `url` | the provider's endpoint | full chat-completions URL |
 | `api_key` | unset | API key; keep the file at mode `0600` |
-| `reasoning` | `low` | `minimal`, `low`, `medium`, `high` or `default` |
+| `reasoning` | the provider's default | `minimal`, `low`, `medium`, `high` or `default` |
 | `thinking` | server default | `on`, `off` or `default` |
 | `temperature` | server default | number from `0` to `2` |
+| `providers` | `{}` | per-provider `url`, `model`, `api_key` and `reasoning`; a name that is not built in adds a provider |
 
-The environment wins over the files: `AGENT_API_KEY` (or the older
-`OPENCODE_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`, `THINKING`,
-`TEMPERATURE`. Other knobs are still environment-only; run `agent.sh -h` for
-the rest.
+The top-level `provider`, `model`, `url`, `api_key`, `reasoning`, `thinking`
+and `temperature` belong together: `model`, `url`, `api_key` and `reasoning`
+apply to the provider that `provider` names at startup. Switching provider in
+the REPL (`/provider use`) uses only the new provider's own key and settings,
+so one provider's key is never sent to another endpoint; agent.sh says so when
+it ignores a top-level value. Inside `providers`, a field in the user's file
+wins over the same field in the system file, and the remaining fields still
+come from the system file.
+
+The environment wins over the files: `AGENT_API_KEY`, the provider's own key
+variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
+`THINKING`, `TEMPERATURE`. Other knobs are still environment-only; run
+`agent.sh -h` for the rest.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AUTO` | `0` | `1` runs commands without asking (same as `-y`) |
 | `MODE` | `build` | `build` or `plan` |
+| `PROVIDER` | `opencode` | provider to use (see [Providers](#providers)) |
+| `AGENT_PLUGINS` | unset | plugin files and directories, colon-separated; `none` loads none (see [Plugins](#plugins)) |
+| `CLI_HINTS` | `1` | `0` stops telling the model about `rg`, `fd`, `fzf`, `ast-grep` and `tree` |
+| `AGENT_RESPONSES_MODELS` | unset | `provider/model` pairs that need `/responses`, space-separated |
 | `MAX_OUT` | `20000` | tool output bytes sent to the model |
 | `READ_LINES` | `400` | lines the `read` tool returns at most |
 | `WEB` | `1` | `0` removes `web_search` and `web_fetch` |
@@ -138,6 +160,69 @@ the rest.
 | `AGENT_CONFIG_DIR` | `$XDG_CONFIG_HOME/agent.sh` | config directory |
 | `AGENT_SYSTEM_CONFIG` | `/etc/agent.sh/config.json` | system config file |
 
+## Providers
+
+`PROVIDER` (or the `provider` config key) picks the endpoint. These are built
+in:
+
+| Provider | Endpoint | Default model | Notes |
+| --- | --- | --- | --- |
+| `opencode` (`opencode-go`) | `https://opencode.ai/zen/go/v1/chat/completions` | `deepseek-v4.1-flash` | default; reasoning `low` |
+| `copilot` (`github-copilot`) | GitHub Copilot API | `gpt-4.1` | sign in with GitHub, see below |
+| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-4.1-mini` | |
+| `openrouter` | `https://openrouter.ai/api/v1/chat/completions` | `openai/gpt-4.1-mini` | |
+| `ollama` | `http://localhost:11434/v1/chat/completions` | `qwen2.5-coder:7b` | local, needs no key |
+
+The models are only starting points; `/model list` shows what the endpoint
+really offers, and `model` and `reasoning` in the config file or the
+environment override the default of the provider they belong to.
+
+The key is looked up in this order: `AGENT_API_KEY`, the provider's own
+variable (`OPENCODE_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`), its
+entry under `providers` in the config file, a key a plugin provides, and at
+startup the top-level `api_key`. `ollama` needs none. A provider's key is
+never sent to another endpoint, so `/provider use` uses only the new
+provider's own key and settings.
+
+A name that is not built in is read from the `providers` object of the config
+file; that also overrides the endpoint, model or key of a built-in one:
+
+```json
+{
+  "providers": {
+    "work": {
+      "url": "https://llm.example.com/v1/chat/completions",
+      "model": "gpt-4.1-mini",
+      "api_key": "sk-work-...",
+      "reasoning": "medium"
+    }
+  }
+}
+```
+
+`/provider` (or `/provider info`) shows the provider, model, endpoint and
+where the key came from. `/provider list` lists every provider this run can
+use, with `*` on the current one and whether it is ready. `/provider use NAME
+[MODEL]` switches for this run; the conversation carries over, the model does
+not (ids differ between providers). It warns when the new endpoint is not
+`https`.
+
+Some endpoints serve a model only at `/responses` (the Responses API) and not
+at `/chat/completions`. agent.sh tries both, remembers which one the model
+needed and goes straight there next time; `/about` shows it. The list is kept
+in `AGENT_RESPONSES_MODELS` as space-separated `provider/model` pairs and is
+passed on to explorers.
+
+### GitHub Copilot
+
+`agent.sh --login copilot` (or `/login copilot` in the REPL) signs in with
+GitHub's device flow: it prints a URL and a code to enter there. The sign-in
+token is kept in `$XDG_CONFIG_HOME/agent.sh/auth.json` (mode `0600`, directory
+`0700`) and exchanged for a short-lived session token for each request. A
+token from `COPILOT_GITHUB_TOKEN`, or the one of the Copilot plugin for
+Vim/Neovim, works too. `/login copilot` then switches the REPL to `copilot`;
+`--login` signs in and exits, so the next start can use `/provider use copilot`.
+
 ## Tools
 
 Besides `bash`, build mode gives the model three file tools and two web
@@ -154,6 +239,14 @@ with DuckDuckGo's HTML page, which needs no key but may refuse automated
 requests. `WEB=0` removes both tools, and `WEB_TIMEOUT` bounds one fetch or
 search. The keys can also be `brave_api_key`, `tavily_api_key` and
 `searxng_url` in the config file.
+
+When `rg`, `fd`/`fdfind`, `fzf`, `ast-grep` or `tree` is installed, the system
+prompt tells the model to use it in place of `grep -r` or `find`: `rg PATTERN`
+instead of `grep -r`, `fd` instead of `find`, `fzf --filter TEXT` (never
+without `--filter`; there is no terminal), `ast-grep -p` for syntax-aware
+search and `tree -L 2 --gitignore` for a directory layout. `CLI_HINTS=0`
+turns this off. `bat` is deliberately not suggested: the `read` tool is
+better for the model.
 
 ## Sub-agents
 
@@ -213,6 +306,59 @@ copies the bundled prompts into it as `NAME.md.example`. Rename one to
 shadow the bundled prompts. The directory is only created once; existing files
 are never overwritten.
 
+## Plugins
+
+A plugin is a bash file sourced into `agent.sh` at startup. Put `*.sh` files
+in `$XDG_CONFIG_HOME/agent.sh/plugins/`, or name files and directories in
+`AGENT_PLUGINS` (colon-separated; `AGENT_PLUGINS=none` loads none). A plugin
+runs as trusted code with the full reach of the script, so only install ones
+you have read. A file or directory that anybody can write to, or that belongs
+to another user, is not loaded; a plugin that fails to load is reported and
+skipped.
+
+At load time a plugin only registers what it adds:
+
+| Call | Adds |
+| --- | --- |
+| `agent_command NAME "help"` | a REPL command `/NAME [args]` that calls `cmd_NAME "args"`; the function may set `AGENT_PROMPT` to send a prompt |
+| `agent_tool NAME "what it does" 'PARAMS' [ro]` | a tool for the model that calls `tool_NAME 'JSON arguments'`; its stdout is the result. `PARAMS` is a JSON schema object; `ro` marks the tool usable in plan mode |
+| `agent_provider NAME` | a provider whose `provider_NAME` sets `P_URL`, `P_MODEL` and optionally `P_REASONING`, `P_KIND` and `P_KEY` |
+| `agent_hook EVENT FUNC` | a function that runs at `EVENT` (see below) |
+
+For a provider, `P_KIND=local` means it needs no key and `P_KIND=copilot` uses
+the Copilot sign-in. `provider_NAME_headers` may print extra request headers,
+and `provider_NAME_prepare` runs before each request: a non-zero status fails
+the call, and `PLUGIN_ERR` says why.
+
+The hooks are `start` (once after loading), `turn_start TEXT` (a turn begins,
+with the text the user typed), `turn_end OK` (a turn ends; `OK` is `1` on
+success), `exit` (the REPL quits), and `tool_call NAME ARGS` (before a tool
+runs, with its JSON arguments; a non-zero status blocks the call and stdout is
+the reason shown to the model).
+
+Names are lower case letters, digits and `_`; a built-in name cannot be taken.
+A plugin tool that is not `ro` asks for confirmation like a command (unless
+`-y`), plan mode only allows `ro` tools, and an explorer (`SUBAGENTS`) does not
+run hooks. `/plugins` lists the files loaded and what each added; `/help`
+lists plugin commands next to the built-in ones.
+
+A small plugin in `~/.config/agent.sh/plugins/todo.sh`:
+
+```sh
+agent_tool todo "list the TODO comments in the project" \
+  '{"type": "object", "properties": {}}' ro
+
+tool_todo() {
+  rg -n 'TODO' . || true
+}
+
+agent_command stamp "start a prompt with the current date"
+
+cmd_stamp() {
+  AGENT_PROMPT="The date is $(date +%F). $*"
+}
+```
+
 ## Usage
 
 | Command | Purpose |
@@ -221,7 +367,15 @@ are never overwritten.
 | `/model` | show model settings |
 | `/model list` | list the models the endpoint offers (current one marked) |
 | `/model use <id>` | switch model by number or name, for this run |
-| `/model set <key> <value>` | change one setting (and only for this run) |
+| `/model set <key> <value>` | change one setting for this run (`model`, `reasoning`, `thinking`, `temperature`, `context`, `compact_at`) |
+| `/provider` | the current provider, model and key source (same as `/provider info`) |
+| `/provider list` | list the providers and whether each is ready (current one marked) |
+| `/provider use <name> [model]` | switch provider (and optionally model) for this run |
+| `/login copilot` | sign in to GitHub Copilot, then switch to it |
+| `/context` | show the context window and the compaction threshold |
+| `/context <tokens\|default>` | set the window in tokens (`default`: unset) |
+| `/context compact <bytes\|default>` | set the compaction threshold itself |
+| `/plugins` | list the plugin files and what each one added |
 | `/compact` | summarize the history (also automatic past `COMPACT_AT`) |
 | `/sessions [all]` | list saved sessions |
 | `/resume ID` | switch to a session by id or unique prefix |
@@ -232,13 +386,21 @@ are never overwritten.
 
 Flags: `-y` (run commands without asking, except the ones below), `-p`/`--plan`
 and `-b`/`--build` (the last one wins), `-i` (stay in the REPL after a prompt),
-`-c`, `-r ID`, `-l [all]`, `-h`, `-V`. A prompt on the command line is
-answered and the agent exits; if the turn fails, the exit status is non-zero,
-so one-shot runs can be used from scripts. `--` ends option parsing.
+`-c`, `-r ID`, `-l [all]`, `--login [copilot]`, `-h`, `-V`. A prompt on the
+command line is answered and the agent exits; if the turn fails, the exit
+status is non-zero, so one-shot runs can be used from scripts. `--` ends
+option parsing. `--login [copilot]` signs in to GitHub Copilot and exits (see
+[GitHub Copilot](#github-copilot)); in the REPL, `/login copilot` signs in and
+switches to it.
 
 Sessions are JSON files under `~/.local/state/agent.sh/sessions`; `-c`
 continues the latest in the current directory, `-r ID` resumes one, `-l [all]`
 lists them. A fresh session (no `-c`/`-r`) starts with the `/about` card.
+Besides the history, a session keeps the provider, model, reasoning, thinking
+and temperature, plus the context window and its compaction threshold; these
+are saved after each turn and restored by `-c` and `-r`. API keys and URLs are
+never saved. A provider is restored only if it still resolves, and values set
+in the environment for this run are kept.
 
 A command is stopped after `CMD_TIMEOUT` seconds when `timeout` is available.
 Commands the model runs do not inherit the API key, and state files are
@@ -258,6 +420,11 @@ Dangerous commands are treated the same way: a program in `ASK_CMDS` in
 command position (`sudo`, `dd`, `reboot`, ...; `ASK_CMDS=""` empties the
 list), a forced push, a hard reset, `git clean -f`, or a download piped into
 a shell.
+
+The config directory (`~/.config/agent.sh`, where the key, the sign-in token
+and the plugins live) is never free: a command that names it asks for
+approval even when it is inside the workspace. A plugin file is not loaded
+when it or its directory is world-writable or owned by another user.
 
 The prompt offers `a` for "always this session", which allows either kind of
 command for the rest of the run; `OUTSIDE` and `ASK_CMDS` set up front do the

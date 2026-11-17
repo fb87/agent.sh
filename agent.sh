@@ -8,6 +8,7 @@
 #
 # Usage: agent.sh [-y] [-p | -b] [-i] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
 #        agent.sh -l [all]
+#        agent.sh --login [copilot]
 #   -y       run commands without asking (same as AUTO=1)
 #   -p       start in plan mode: read-only commands, no edits (--plan)
 #   -b       start in build mode, the default (--build); the last one wins
@@ -26,7 +27,9 @@
 # /model set temperature 0.1 (or reasoning medium, thinking off) changes one
 # for this run, as do the MODEL, REASONING, THINKING and TEMPERATURE
 # environment variables. /model list prints the models the endpoint offers
-# and /model use picks one by number or name.
+# and /model use picks one by number or name. /context shows the window and
+# /context 128000 sets it in tokens at any time (/context compact BYTES sets
+# the compaction threshold itself); a session keeps both.
 # There are two modes. Build (the default) edits files and runs commands.
 # Plan only inspects: it runs read-only commands and refuses everything else.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
@@ -36,9 +39,26 @@
 # CONTEXT is the model's window in tokens. When it is set, COMPACT_AT
 # defaults to half of it, at 4 bytes per token (CONTEXT=128000 compacts at
 # 256000 bytes); unset or 0, it keeps the old 100000 bytes.
+# Plugins: *.sh files in $XDG_CONFIG_HOME/agent.sh/plugins (and AGENT_PLUGINS)
+# are sourced at startup and add commands, tools, providers and hooks;
+# /plugins lists them, AGENT_PLUGINS=none loads none (README, "Plugins").
+# rg, fd (fdfind), fzf, ast-grep and tree, when installed, are suggested to
+# the model in place of grep -r and find; CLI_HINTS=0 turns that off.
 # Settings can come from $XDG_CONFIG_HOME/agent.sh/config.json: "provider",
 # "model", "url" and "api_key" (plus reasoning, thinking and temperature).
 # Environment variables win over that file.
+# Providers: opencode (the default), copilot (GitHub Copilot), openai,
+# openrouter and ollama are built in; PROVIDER picks one. A key is read from
+# AGENT_API_KEY, else OPENCODE_API_KEY, OPENAI_API_KEY or OPENROUTER_API_KEY
+# for that provider, else "api_key" in the config file. The "providers"
+# object in config.json sets a model, key or endpoint for each provider and
+# can add your own: {"providers": {"work": {"url": "https://host/v1/chat/
+# completions", "api_key": "...", "model": "..."}}}. The REPL switches with
+# /provider list and /provider use NAME [MODEL]; one provider's key is never
+# sent to another. Copilot signs in with GitHub's device flow: run
+# agent.sh --login copilot (or /login copilot); the token is kept in
+# $XDG_CONFIG_HOME/agent.sh/auth.json, 0600. COPILOT_GITHUB_TOKEN, or the
+# token of the Copilot plugin for Vim/Neovim, also works.
 # Tools the model has: bash; read, edit and write for files (reading inside
 # the workspace needs no approval; edit and write show the change and ask);
 # web_search and web_fetch (WEB=0 removes them); explore (below). web_search
@@ -95,24 +115,33 @@ URL_ENV_SET=${URL+1};                  URL_ENV="${URL-}"
 REASONING_ENV_SET=${REASONING+1};      REASONING_ENV="${REASONING-}"
 THINKING_ENV_SET=${THINKING+1};        THINKING_ENV="${THINKING-}"
 TEMPERATURE_ENV_SET=${TEMPERATURE+1};  TEMPERATURE_ENV="${TEMPERATURE-}"
+CONTEXT_ENV_SET=${CONTEXT+1};          COMPACT_AT_ENV_SET=${COMPACT_AT:+1}
 AGENT_API_KEY_ENV_SET=${AGENT_API_KEY+1}
 AGENT_API_KEY_ENV="${AGENT_API_KEY-}"
-OPENCODE_API_KEY_ENV_SET=${OPENCODE_API_KEY+1}
-OPENCODE_API_KEY_ENV="${OPENCODE_API_KEY-}"
 # The key stays in this shell only: commands the model runs must not inherit
 # it (an "env" would put it in the transcript and send it to the provider).
 BRAVE_KEY="${BRAVE_API_KEY-}"
 TAVILY_KEY="${TAVILY_API_KEY-}"
-unset AGENT_API_KEY OPENCODE_API_KEY BRAVE_API_KEY TAVILY_API_KEY
+# The key each built-in provider takes from the environment (ENVKEY_<name>)
+ENVKEY_opencode="${OPENCODE_API_KEY-}"
+ENVKEY_openai="${OPENAI_API_KEY-}"
+ENVKEY_openrouter="${OPENROUTER_API_KEY-}"
+COPILOT_ENV_TOKEN="${COPILOT_GITHUB_TOKEN-}"
+unset AGENT_API_KEY OPENCODE_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY \
+  COPILOT_GITHUB_TOKEN BRAVE_API_KEY TAVILY_API_KEY
 # Sessions, history and temp files hold command output and may hold secrets:
 # create them private. Commands the model runs get the original umask back.
 ORIG_UMASK=$(umask)
 umask 077
 
-MODEL="deepseek-v4.1-flash"            # can come from config or environment
-PROVIDER="opencode"                    # opencode (aka opencode-go)
+MODEL=""                               # default is the provider's
+MODEL_GIVEN=0                          # 1 = set by config or environment
+PROVIDER="opencode"                    # opencode copilot openai openrouter
+                                       # ollama, or one from "providers"
 URL=""                                 # default is the provider's endpoint
-REASONING="low"                        # reasoning effort ("" = omit the field)
+URL_GIVEN=0                            # 1 = set by config or environment
+REASONING=""                           # reasoning effort ("" = omit the field)
+REASONING_GIVEN=0                      # default: the provider's (opencode: low)
 THINKING=""                            # on/off ("" = server default)
 TEMPERATURE=""                         # 0..2 ("" = server default)
 AUTO="${AUTO:-0}"                      # 1 = no confirmation prompt
@@ -168,8 +197,28 @@ PROMPT_DIR="${PROMPT_DIR-}"            # explicit prompt directory, if set
 PROMPT_DIRS=()                         # search path, filled by the function
 PROMPT_FROM="built-in"                 # set by read_prompt
 INSTALL_DIR=""                         # directory containing agent.sh
+CFG_MODEL=""; CFG_URL=""; CFG_API_KEY=""     # top level of the config
+CFG_REASONING=""; CFG_REASONING_SET=0
+CFG_THINKING=""; CFG_THINKING_SET=0
 API_KEY=""                             # set by load_settings
 API_KEY_SOURCE=""
+PKIND="plain"                          # opencode, copilot, local or plain
+URL_FIXED=0                            # 1 = the user chose this endpoint
+RESP_MODELS="${AGENT_RESPONSES_MODELS-}"  # models that need /responses
+# GitHub Copilot: a sign-in token is exchanged for a short-lived session
+# token (API_KEY) that expires at COPILOT_EXP (epoch seconds). The client id
+# is the public one of the Copilot plugin for Vim/Neovim. The URLs can be
+# replaced for testing.
+COPILOT_OAUTH=""
+COPILOT_EXP=0
+COPILOT_CLIENT_ID="Iv1.b507a08c87ecfe98"
+COPILOT_API_URL="${COPILOT_API_URL:-\
+https://api.githubcopilot.com/chat/completions}"
+COPILOT_TOKEN_URL="${COPILOT_TOKEN_URL:-\
+https://api.github.com/copilot_internal/v2/token}"
+COPILOT_LOGIN_URL="${COPILOT_LOGIN_URL:-https://github.com}"
+COPILOT_EDITOR="${COPILOT_EDITOR:-vscode/1.99.3}"
+COPILOT_PLUGIN="${COPILOT_PLUGIN:-copilot-chat/0.26.7}"
 CONFIG_LOADED=0
 
 VERSION="0.4.0"
@@ -195,13 +244,707 @@ resolve_self() {
   printf '%s/%s' "$dir" "$(basename "$src")"
 }
 
-# The endpoint for a known provider; fails for one we do not know.
-provider_url() {
+# ----------------------------------------------------------------- plugins
+
+# Plugins are bash files, *.sh in $CONFIG_DIR/plugins (and the files or
+# directories of AGENT_PLUGINS, separated by colons; AGENT_PLUGINS=none loads
+# none).
+# Each is sourced into this shell at startup, so it is trusted code with the
+# reach of the script itself. At load time it only registers what it adds:
+#
+#   agent_command NAME "help"       /NAME [args] -> cmd_NAME "args"; a
+#                                   command may set AGENT_PROMPT to send it
+#   agent_tool NAME "what it does" 'PARAMS' [ro]
+#                                   a tool for the model -> tool_NAME 'JSON
+#                                   arguments', its stdout is the result;
+#                                   PARAMS is a JSON schema object, "ro" marks
+#                                   it usable in plan mode
+#   agent_provider NAME             provider_NAME sets P_URL, P_MODEL and
+#                                   optionally P_REASONING, P_KIND, P_KEY;
+#                                   provider_NAME_headers prints extra
+#                                   headers, provider_NAME_prepare runs before
+#                                   each request (non-zero = fail, PLUGIN_ERR)
+#   agent_hook EVENT FUNC           start, turn_start TEXT, turn_end OK,
+#                                   exit, and tool_call NAME ARGS (non-zero
+#                                   blocks the call; stdout is the reason)
+#
+# Names are lower case letters, digits and _. A built-in name cannot be taken.
+PLUGIN_FILES=""
+PLUGIN_COMMANDS=" "
+PLUGIN_COMMAND_HELP=""
+PLUGIN_TOOLS_JSON="[]"
+PLUGIN_TOOLS_RO=" "
+PLUGIN_PROVIDERS=" "
+PLUGIN_HOOKS=" "
+PLUGIN_CURRENT=""
+PLUGIN_ERR=""
+AGENT_PROMPT=""
+PLUGIN_BUILTIN_COMMANDS=" help about model provider login compact context"
+PLUGIN_BUILTIN_COMMANDS+=" sessions resume reset auto plan build exit quit"
+PLUGIN_BUILTIN_COMMANDS+=" plugins "
+PLUGIN_BUILTIN_TOOLS=" bash read write edit web_search web_fetch explore "
+PLUGIN_BUILTIN_PROVIDERS=" opencode opencode-go copilot github-copilot openai"
+PLUGIN_BUILTIN_PROVIDERS+=" openrouter ollama "
+PLUGIN_EVENTS=" start turn_start turn_end exit tool_call "
+
+plugin_warn() {
+  printf 'agent.sh: plugin %s: %s\n' "${PLUGIN_CURRENT:-?}" "$*" >&2
+}
+
+# True if $1 may name something a plugin adds
+plugin_name_ok() {
+  if [[ ! "$1" =~ ^[a-z][a-z0-9_]*$ ]]; then
+    plugin_warn "'$1' is not a usable name (lower case letters, digits, _)"
+    return 1
+  fi
+}
+
+agent_command() {
+  local name="${1:-}"
+  plugin_name_ok "$name" || return 0
+  if [[ "$PLUGIN_BUILTIN_COMMANDS" == *" $name "* ]]; then
+    plugin_warn "/$name is a built-in command"; return 0
+  fi
+  if [[ "$PLUGIN_COMMANDS" == *" $name "* ]]; then
+    plugin_warn "/$name is already taken by another plugin"; return 0
+  fi
+  PLUGIN_COMMANDS+="$name "
+  PLUGIN_COMMAND_HELP+="$name"$'\x1f'"${2:-}"$'\x1f'"$PLUGIN_CURRENT"$'\n'
+}
+
+agent_tool() {
+  local name="${1:-}" desc="${2:-}" params="${3:-}"
+  plugin_name_ok "$name" || return 0
+  if [[ "$PLUGIN_BUILTIN_TOOLS" == *" $name "* ]]; then
+    plugin_warn "$name is a built-in tool"; return 0
+  fi
+  if [[ ", $PLUGIN_TOOLS_NAMES, " == *", $name, "* ]]; then
+    plugin_warn "tool $name is already taken by another plugin"; return 0
+  fi
+  [[ -n "$params" ]] || params='{"type": "object", "properties": {}}'
+  if ! jq -e 'type == "object"' <<<"$params" >/dev/null 2>&1; then
+    plugin_warn "the parameters of tool $name are not a JSON object"; return 0
+  fi
+  PLUGIN_TOOLS_JSON=$(jq -c --arg n "$name" --arg d "$desc" \
+    --argjson p "$params" \
+    '. + [{type: "function",
+           function: {name: $n, description: $d, parameters: $p}}]' \
+    <<<"$PLUGIN_TOOLS_JSON")
+  PLUGIN_TOOLS_NAMES+="${PLUGIN_TOOLS_NAMES:+, }$name"
+  if [[ "${4:-}" == ro ]]; then PLUGIN_TOOLS_RO+="$name "; fi
+}
+PLUGIN_TOOLS_NAMES=""
+
+agent_provider() {
+  local name="${1:-}"
+  plugin_name_ok "$name" || return 0
+  if [[ "$PLUGIN_BUILTIN_PROVIDERS" == *" $name "* ]]; then
+    plugin_warn "$name is a built-in provider"; return 0
+  fi
+  if [[ "$PLUGIN_PROVIDERS" == *" $name "* ]]; then
+    plugin_warn "provider $name is already taken by another plugin"; return 0
+  fi
+  PLUGIN_PROVIDERS+="$name "
+}
+
+agent_hook() {
+  local event="${1:-}" fn="${2:-}"
+  if [[ "$PLUGIN_EVENTS" != *" $event "* ]]; then
+    plugin_warn "unknown event '$event' (${PLUGIN_EVENTS# })"; return 0
+  fi
+  if [[ ! "$fn" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    plugin_warn "hook $event needs a function name"; return 0
+  fi
+  PLUGIN_HOOKS+="$event:$fn "
+}
+
+# True if nobody but the user (or root) could have written plugin file $1 or
+# can replace it; otherwise says why in PLUGIN_ERR
+plugin_file_safe() {
+  local f="$1" d
+  d=$(dirname "$f")
+  PLUGIN_ERR=""
+  if [[ -n "$(find "$f" -maxdepth 0 -perm -002 2>/dev/null)" ]]; then
+    PLUGIN_ERR="anybody can write to it"
+  elif [[ -n "$(find "$d" -maxdepth 0 -perm -002 2>/dev/null)" ]]; then
+    PLUGIN_ERR="anybody can write to its directory"
+  elif [[ ! -O "$f" && -z "$(find "$f" -maxdepth 0 -user 0 2>/dev/null)" ]]
+  then
+    PLUGIN_ERR="it belongs to another user"
+  fi
+  [[ -z "$PLUGIN_ERR" ]]
+}
+
+# Runs a plugin function in this shell. A plugin is not written for
+# "set -u": an unset variable there must not end the whole session.
+plugin_call() {
+  local rc=0
+  set +u
+  "$@" || rc=$?
+  set -u
+  return "$rc"
+}
+
+# Sources the plugin files. One that fails to load is reported and
+# skipped, not fatal; one anybody can write to is not loaded at all.
+load_plugins() {
+  local spec f g list="" IFS_SAVE="$IFS"
+  [[ "${AGENT_PLUGINS-}" == none ]] && return 0
+  if [[ -d "$CONFIG_DIR/plugins" ]]; then
+    for g in "$CONFIG_DIR/plugins"/*.sh; do
+      [[ -f "$g" ]] && list+="$g"$'\n'
+    done
+  fi
+  if [[ -n "${AGENT_PLUGINS-}" ]]; then
+    while IFS= read -r spec; do
+      [[ -n "$spec" ]] || continue
+      if [[ -d "$spec" ]]; then
+        for g in "$spec"/*.sh; do
+          [[ -f "$g" ]] && list+="$g"$'\n'
+        done
+      elif [[ -f "$spec" ]]; then list+="$spec"$'\n'
+      else printf 'agent.sh: AGENT_PLUGINS: %s does not exist\n' "$spec" >&2
+      fi
+    done < <(printf '%s\n' "$AGENT_PLUGINS" | tr ':' '\n')
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ "$f" == /* ]] || f="./$f"
+    # Code that another user could have written or can replace is not run
+    if ! plugin_file_safe "$f"; then
+      printf 'agent.sh: not loading %s: %s\n' "$f" "$PLUGIN_ERR" >&2
+      continue
+    fi
+    PLUGIN_CURRENT="${f##*/}"
+    PLUGIN_FILES+="$f"$'\n'
+    # shellcheck disable=SC1090
+    set +u
+    if ! . "$f"; then plugin_warn "stopped with an error while loading"; fi
+    set -u
+  done <<<"$list"
+  PLUGIN_CURRENT=""
+  IFS="$IFS_SAVE"
+}
+
+# Runs the hooks of event $1 with the other arguments; never fatal. Not in
+# an explorer: its parent runs them.
+plugin_hooks() {
+  local event="$1" h
+  shift
+  (( SUB )) && return 0
+  [[ "$PLUGIN_HOOKS" == *" $event:"* ]] || return 0
+  for h in $PLUGIN_HOOKS; do
+    [[ "$h" == "$event:"* ]] || continue
+    if declare -F "${h#*:}" >/dev/null; then
+      plugin_call "${h#*:}" "$@" || true
+    else
+      printf 'agent.sh: hook %s: no function %s\n' "$event" "${h#*:}" >&2
+    fi
+  done
+}
+
+# The tool_call hooks: prints the reason and fails if one blocks the call
+plugin_tool_allowed() {
+  local h out
+  [[ "$PLUGIN_HOOKS" == *" tool_call:"* ]] || return 0
+  for h in $PLUGIN_HOOKS; do
+    [[ "$h" == tool_call:* ]] || continue
+    declare -F "${h#*:}" >/dev/null || continue
+    if ! out=$(set +u; "${h#*:}" "$1" "$2" 2>&9); then
+      printf '%s' "$out"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Runs plugin tool $1 with the arguments object $2: its stdout is the
+# result. Plan mode only allows the ones registered as read-only.
+plugin_tool_run() {
+  local name="$1" args="$2" out rc=0
+  if [[ "$MODE" == plan && "$PLUGIN_TOOLS_RO" != *" $name "* ]]; then
+    TOOL_OUT="Plan mode: $name is not read-only, so it was not run."
+    printf '\033[33m%s\033[0m\n' "$TOOL_OUT" >&9
+    return 0
+  fi
+  if ! declare -F "tool_$name" >/dev/null; then
+    TOOL_OUT="Error: the plugin did not define tool_$name."
+    return 0
+  fi
+  tool_line "$name $args"
+  # Like a command: a tool that may change things is asked about first
+  if [[ "$PLUGIN_TOOLS_RO" != *" $name "* ]]; then
+    confirm "Run it?" "to run the $name tool" \
+      "run with -y to approve up front" || return 0
+  fi
+  out=$(set +u; "tool_$name" "$args" 2>&9) || rc=$?
+  if (( ${#out} > MAX_OUT )); then
+    out="${out:0:MAX_OUT}"$'\n'"...[output truncated]..."
+  fi
+  if (( rc )); then out+=$'\n'"[exit code $rc]"; fi
+  TOOL_OUT="$out"
+}
+
+# True if $1 is a command a plugin added; sets PLUGIN_CMD and PLUGIN_ARGS
+plugin_command_match() {
+  [[ "$PLUGIN_COMMANDS" != " " ]] || return 1
+  [[ "$1" =~ ^/([a-z][a-z0-9_]*)([[:space:]]+(.*))?$ ]] || return 1
+  [[ "$PLUGIN_COMMANDS" == *" ${BASH_REMATCH[1]} "* ]] || return 1
+  PLUGIN_CMD="${BASH_REMATCH[1]}"; PLUGIN_ARGS="${BASH_REMATCH[3]:-}"
+}
+
+# /plugins: what is loaded and what each file added
+plugin_info() {
+  local f n t any=0 line h
+  if [[ -z "$PLUGIN_FILES" ]]; then
+    printf 'No plugins. Put *.sh files in %s/plugins (see the README).\n' \
+      "$CONFIG_DIR"
+    return 0
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    printf '  %s\n' "$f"
+  done <<<"$PLUGIN_FILES"
+  [[ "$PLUGIN_COMMANDS" == " " ]] || printf '  commands   %s\n' \
+    "$(sed 's/^ //; s/ $//; s/ /, \//g; s/^/\//' <<<"$PLUGIN_COMMANDS")"
+  [[ -z "$PLUGIN_TOOLS_NAMES" ]] ||
+    printf '  tools      %s\n' "$PLUGIN_TOOLS_NAMES"
+  [[ "$PLUGIN_PROVIDERS" == " " ]] || printf '  providers  %s\n' \
+    "$(sed 's/^ //; s/ $//; s/ /, /g' <<<"$PLUGIN_PROVIDERS")"
+  [[ "$PLUGIN_HOOKS" == " " ]] || printf '  hooks      %s\n' \
+    "$(sed 's/^ //; s/ $//; s/ /, /g' <<<"$PLUGIN_HOOKS")"
+}
+
+# ------------------------------------------------------------------ providers
+
+# The built-in providers. Sets P_NAME (the canonical name), P_KIND (opencode,
+# copilot, local = no key needed, plain), P_URL, P_MODEL and P_REASONING (the
+# defaults); fails for a name that is not built in. The models are only
+# starting points: /model list shows what the endpoint really offers.
+provider_spec() {
+  P_NAME="$1"; P_KIND=plain; P_URL=""; P_MODEL=""; P_REASONING=""; P_KEY=""
   case "$1" in
     opencode|opencode-go)
-      printf '%s' 'https://opencode.ai/zen/go/v1/chat/completions' ;;
-    *) return 1 ;;
+      P_NAME=opencode; P_KIND=opencode; P_REASONING=low
+      P_URL='https://opencode.ai/zen/go/v1/chat/completions'
+      P_MODEL="deepseek-v4.1-flash" ;;
+    copilot|github-copilot)
+      P_NAME=copilot; P_KIND=copilot
+      P_URL="$COPILOT_API_URL"; P_MODEL="gpt-4.1" ;;
+    openai)
+      P_URL='https://api.openai.com/v1/chat/completions'
+      P_MODEL="gpt-4.1-mini" ;;
+    openrouter)
+      P_URL='https://openrouter.ai/api/v1/chat/completions'
+      P_MODEL="openai/gpt-4.1-mini" ;;
+    ollama)
+      P_KIND=local
+      P_URL='http://localhost:11434/v1/chat/completions'
+      P_MODEL="qwen2.5-coder:7b" ;;
+    *) # one a plugin added: its function says what it is
+       if [[ "$PLUGIN_PROVIDERS" == *" $1 "* ]] && declare -F "provider_$1" \
+            >/dev/null; then
+         plugin_call "provider_$1" || true
+         return 0
+       fi
+       return 1 ;;
   esac
+}
+
+# What the "providers" object of the config files says about provider $1:
+# url, model, api_key and reasoning, separated by \x1f (the user's file wins
+# over the system one, field by field).
+cfg_provider() {
+  local f v url="" model="" key="" reasoning="" a b c d
+  for f in "$SYSTEM_CONFIG_FILE" "$CONFIG_FILE"; do
+    [[ -f "$f" ]] || continue
+    v=$(jq -r --arg p "$1" '
+      (.providers // {}) | (if type == "object" then .[$p] else null end)
+      | if type == "object" then
+          [.url, .model, .api_key, .reasoning]
+          | map(if type == "string" then . else "" end) | join("\u001f")
+        else "" end' "$f" 2>/dev/null) || v=""
+    IFS=$'\x1f' read -r a b c d <<<"$v" || true
+    if [[ -n "$a" ]]; then url="$a"; fi
+    if [[ -n "$b" ]]; then model="$b"; fi
+    if [[ -n "$c" ]]; then key="$c"; fi
+    if [[ -n "$d" ]]; then reasoning="$d"; fi
+  done
+  printf '%s\x1f%s\x1f%s\x1f%s' "$url" "$model" "$key" "$reasoning"
+}
+
+# The names under "providers" in the config files, one per line
+cfg_provider_names() {
+  local f
+  for f in "$SYSTEM_CONFIG_FILE" "$CONFIG_FILE"; do
+    [[ -f "$f" ]] || continue
+    jq -r '(.providers // {})
+           | if type == "object" then keys[] else empty end' \
+      "$f" 2>/dev/null || true
+  done
+}
+
+# The built-in name a provider name stands for (opencode-go -> opencode)
+canon_provider() {
+  if provider_spec "$1"; then printf '%s' "$P_NAME"; else printf '%s' "$1"; fi
+}
+
+upper() { printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'; }
+
+# The key the environment gave a built-in provider ("" if none)
+env_key() {
+  local var="ENVKEY_${1//[^A-Za-z0-9]/_}"
+  printf '%s' "${!var-}"
+}
+
+# The GitHub sign-in token for Copilot: from COPILOT_GITHUB_TOKEN, from our
+# own auth.json, or from the Copilot plugin for Vim/Neovim. Sets R_OAUTH and
+# R_KEY_SRC; fails if there is none.
+copilot_find_token() {
+  local f t
+  R_OAUTH=""
+  if [[ -n "$COPILOT_ENV_TOKEN" ]]; then
+    R_OAUTH="$COPILOT_ENV_TOKEN"; R_KEY_SRC="env COPILOT_GITHUB_TOKEN"
+    return 0
+  fi
+  f="$CONFIG_DIR/auth.json"
+  t=$(jq -r '.copilot.oauth_token // empty' "$f" 2>/dev/null) || t=""
+  if [[ -n "$t" ]]; then R_OAUTH="$t"; R_KEY_SRC="$f"; return 0; fi
+  for f in "$XDG_CONFIG_HOME/github-copilot/apps.json" \
+           "$XDG_CONFIG_HOME/github-copilot/hosts.json"; do
+    [[ -f "$f" ]] || continue
+    t=$(jq -r '[.[]? | objects | .oauth_token? // empty] | first // empty' \
+          "$f" 2>/dev/null) || t=""
+    if [[ -n "$t" ]]; then R_OAUTH="$t"; R_KEY_SRC="$f"; return 0; fi
+  done
+  return 1
+}
+
+# Works out everything that belongs to provider $1 into R_* variables and
+# leaves the live settings alone, so a failed switch changes nothing. $2 is 1
+# at startup, when the top-level "url", "model", "api_key" of the config and
+# the environment (URL, MODEL, REASONING, AGENT_API_KEY) belong to this
+# provider; 0 when switching, when only what is specific to the provider
+# counts: its environment variable, its entry in "providers", the defaults.
+# The key of one provider is therefore never sent to another.
+resolve_provider() {
+  local name="$1" initial="$2" cp_url cp_model cp_key cp_reasoning builtin=1
+  R_ERR=""; R_OAUTH=""; R_KEY=""; R_KEY_SRC=""; R_FIXED=0
+  if ! provider_spec "$name"; then
+    builtin=0
+    P_NAME="$name"; P_KIND=plain; P_URL=""; P_MODEL=""; P_REASONING=""
+  fi
+  IFS=$'\x1f' read -r cp_url cp_model cp_key cp_reasoning \
+    < <(cfg_provider "$name") || true
+  R_NAME="$P_NAME"; R_KIND="$P_KIND"
+
+  R_URL="$P_URL"
+  if [[ -n "$cp_url" ]]; then R_URL="$cp_url"; R_FIXED=1; fi
+  if (( initial && URL_GIVEN )); then R_URL="$URL"; R_FIXED=1; fi
+  if [[ -z "$R_URL" ]]; then
+    R_ERR="unknown provider \"$name\"; add it under \"providers\" in"
+    R_ERR+=" $CONFIG_FILE with a \"url\" (/provider list shows the others)"
+    return 1
+  fi
+
+  if (( initial && MODEL_GIVEN )); then R_MODEL="$MODEL"
+  elif [[ -n "$cp_model" ]]; then R_MODEL="$cp_model"
+  else R_MODEL="$P_MODEL"; fi
+  if [[ -z "$R_MODEL" ]]; then
+    R_ERR="provider \"$name\" has no default model; set \"model\" under"
+    R_ERR+=" providers.$name in $CONFIG_FILE"
+    return 1
+  fi
+
+  if (( initial && REASONING_GIVEN )); then R_REASONING="$REASONING"
+  elif [[ -n "$cp_reasoning" ]]; then
+    case "$cp_reasoning" in
+      default|off|none) R_REASONING="" ;;
+      minimal|low|medium|high) R_REASONING="$cp_reasoning" ;;
+      *) R_ERR="reasoning of provider \"$name\" must be minimal, low,"
+         R_ERR+=" medium, high or default"
+         return 1 ;;
+    esac
+  else R_REASONING="$P_REASONING"; fi
+
+  if [[ "$R_KIND" == copilot ]]; then
+    if (( SUB )); then            # an explorer is handed its parent's token
+      R_KEY="$AGENT_API_KEY_ENV"; R_KEY_SRC="parent agent"
+      if [[ -z "$R_KEY" ]]; then R_ERR="no Copilot token from the parent"
+        return 1; fi
+    elif (( initial )) && [[ -n "$AGENT_API_KEY_ENV" ]]; then
+      R_OAUTH="$AGENT_API_KEY_ENV"; R_KEY_SRC="env AGENT_API_KEY"
+    elif ! copilot_find_token; then
+      R_ERR="not signed in to GitHub Copilot: run agent.sh --login copilot"
+      R_ERR+=" (or /login copilot)"
+      return 1
+    fi
+    return 0
+  fi
+  if (( initial )) && [[ -n "$AGENT_API_KEY_ENV" ]]; then
+    R_KEY="$AGENT_API_KEY_ENV"; R_KEY_SRC="env AGENT_API_KEY"
+  elif [[ -n "$(env_key "$name")" ]]; then
+    R_KEY="$(env_key "$name")"; R_KEY_SRC="env $(upper "$name")_API_KEY"
+  elif [[ -n "$cp_key" ]]; then
+    R_KEY="$cp_key"; R_KEY_SRC="config providers.$name"
+  elif (( builtin )) && [[ -n "${P_KEY:-}" ]]; then
+    R_KEY="$P_KEY"; R_KEY_SRC="plugin"
+  elif (( initial )) && [[ -n "$API_KEY" ]]; then
+    R_KEY="$API_KEY"; R_KEY_SRC="$API_KEY_SOURCE"
+  elif (( initial && ! builtin )) && [[ -n "$ENVKEY_opencode" ]]; then
+    R_KEY="$ENVKEY_opencode"; R_KEY_SRC="env OPENCODE_API_KEY"
+  elif [[ "$R_KIND" == local ]]; then
+    R_KEY="none"; R_KEY_SRC="none needed"
+  else
+    R_ERR="no API key for provider \"$name\": set "
+    if (( initial )); then R_ERR+="AGENT_API_KEY or "; fi
+    if (( builtin )) && [[ "$PLUGIN_PROVIDERS" != *" $name "* ]]; then
+      R_ERR+="$(upper "$name")_API_KEY or "
+    fi
+    R_ERR+="\"api_key\" in $CONFIG_FILE"
+    if (( ! builtin )) || [[ "$PLUGIN_PROVIDERS" == *" $name "* ]]; then
+      R_ERR+=" (under providers.$name)"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# What a failed reply said, on one line: the "message" of a JSON error, else
+# the first bytes of the body
+reply_note() {
+  [[ -s "$1" ]] || return 0
+  jq -r '(.error.message? // .error? // .message? // empty)
+         | if type == "string" then . else tojson end' "$1" 2>/dev/null |
+    head -c 300 | tr '\n' ' ' | grep . || head -c 300 "$1" | tr '\n' ' '
+}
+
+# Makes the result of resolve_provider the live settings
+commit_provider() {
+  PROVIDER="$R_NAME"; PKIND="$R_KIND"; URL="$R_URL"; URL_FIXED="$R_FIXED"
+  MODEL="$R_MODEL"; REASONING="$R_REASONING"
+  API_KEY="$R_KEY"; API_KEY_SOURCE="$R_KEY_SRC"
+  COPILOT_OAUTH="$R_OAUTH"; COPILOT_EXP=0
+  if [[ -n "${TMP:-}" ]]; then rm -f "$TMP/auth"; fi
+}
+
+# Writes the header file curl reads (-H @file): the key goes there rather
+# than on the command line, where ps would show it.
+write_auth() {
+  local tmp="$TMP/auth.$$"
+  {
+    # one line whatever the key holds: a line break would add a header
+    printf 'Authorization: Bearer %s\n' "${API_KEY//[$'\r\n']/}"
+    if [[ "$PKIND" == copilot ]]; then
+      printf 'Copilot-Integration-Id: vscode-chat\n'
+      printf 'Editor-Version: %s\n' "$COPILOT_EDITOR"
+      printf 'Editor-Plugin-Version: %s\n' "$COPILOT_PLUGIN"
+      printf 'User-Agent: GitHubCopilotChat/%s\n' "${COPILOT_PLUGIN#*/}"
+    fi
+    if [[ "$PLUGIN_PROVIDERS" == *" $PROVIDER "* ]] &&
+       declare -F "provider_${PROVIDER}_headers" >/dev/null; then
+      plugin_call "provider_${PROVIDER}_headers" | tr -d '\r' || true
+    fi
+  } >"$tmp" 2>/dev/null && mv -f "$tmp" "$TMP/auth" 2>/dev/null || true
+}
+
+# Copilot: makes sure API_KEY is a session token with at least $1 seconds
+# left (120 by default), exchanging the sign-in token when it is not. Says
+# why and fails if GitHub does not give one.
+copilot_session() {
+  local margin="${1:-120}" now code hdr tok exp api note
+  if (( SUB )); then return 0; fi
+  now=$(date +%s)
+  if [[ -n "$API_KEY" ]] && (( COPILOT_EXP - now > margin )); then
+    return 0
+  fi
+  [[ -d "$TMP" ]] || mkdir -p "$TMP" 2>/dev/null || true
+  hdr="$TMP/cp.hdr"
+  {
+    printf 'Authorization: token %s\n' "$COPILOT_OAUTH"
+    printf 'Accept: application/json\n'
+    printf 'Editor-Version: %s\n' "$COPILOT_EDITOR"
+    printf 'Editor-Plugin-Version: %s\n' "$COPILOT_PLUGIN"
+    printf 'User-Agent: GitHubCopilotChat/%s\n' "${COPILOT_PLUGIN#*/}"
+  } >"$hdr" 2>/dev/null || true
+  code=$(curl -sS --connect-timeout 30 --max-time 60 -H @"$hdr" \
+    -o "$TMP/cp.json" -w '%{http_code}' "$COPILOT_TOKEN_URL" \
+    2>"$TMP/cp.err") || code=""
+  rm -f "$hdr"
+  case "$code" in
+    2??) ;;
+    401|403)
+      COPILOT_LAST_ERR="GitHub refused the Copilot sign-in (HTTP $code): run"
+      COPILOT_LAST_ERR+=" agent.sh --login copilot again"
+      note=$(reply_note "$TMP/cp.json") || note=""
+      if [[ -n "$note" ]]; then COPILOT_LAST_ERR+=" [GitHub said: $note]"; fi
+      return 1 ;;
+    404)
+      COPILOT_LAST_ERR="this GitHub account has no Copilot access (HTTP 404)"
+      return 1 ;;
+    *)
+      COPILOT_LAST_ERR="cannot get a Copilot token${code:+ (HTTP $code)}"
+      if [[ -s "$TMP/cp.err" ]]; then
+        COPILOT_LAST_ERR+=": $(head -c 200 "$TMP/cp.err" | tr '\n' ' ')"
+      fi
+      note=$(reply_note "$TMP/cp.json") || note=""
+      if [[ -n "$note" ]]; then COPILOT_LAST_ERR+=" [GitHub said: $note]"; fi
+      return 1 ;;
+  esac
+  tok=$(jq -r '.token // empty' "$TMP/cp.json" 2>/dev/null) || tok=""
+  if [[ -z "$tok" ]]; then
+    COPILOT_LAST_ERR="GitHub's reply held no Copilot token"
+    return 1
+  fi
+  exp=$(jq -r '.expires_at // empty | tonumber? // empty' "$TMP/cp.json" \
+          2>/dev/null) || exp=""
+  [[ "$exp" =~ ^[0-9]+$ ]] || exp=$((now + 1500))
+  API_KEY="$tok"; COPILOT_EXP="$exp"
+  # The reply names the host to talk to (business and enterprise plans have
+  # their own); only a githubcopilot.com host is trusted with the token.
+  api=$(jq -r '.endpoints.api // empty' "$TMP/cp.json" 2>/dev/null) || api=""
+  if (( ! URL_FIXED )) &&
+     [[ "$api" =~ ^https://([A-Za-z0-9-]+\.)*githubcopilot\.com$ ]]; then
+    URL="$api/chat/completions"
+  fi
+  rm -f "$TMP/cp.json" "$TMP/cp.err"
+  write_auth
+}
+
+# GitHub's device flow: shows a code to enter on github.com, waits for the
+# approval and keeps the sign-in token in auth.json (0600).
+copilot_login() {
+  local body reply code user_code uri interval expires deadline now tok err f
+  local -a hdrs=(-H "Accept: application/json"
+                 -H "Content-Type: application/json"
+                 -H "Editor-Version: $COPILOT_EDITOR"
+                 -H "Editor-Plugin-Version: $COPILOT_PLUGIN"
+                 -H "User-Agent: GitHubCopilotChat/${COPILOT_PLUGIN#*/}")
+  body=$(jq -cn --arg id "$COPILOT_CLIENT_ID" \
+           '{client_id: $id, scope: "read:user"}')
+  reply=$(curl -sS --connect-timeout 30 --max-time 60 "${hdrs[@]}" \
+    -d @- "$COPILOT_LOGIN_URL/login/device/code" 2>&1 <<<"$body") || {
+    printf 'agent.sh: cannot reach GitHub: %s\n' "$reply" >&2; return 1; }
+  code=$(jq -r '.device_code // empty' <<<"$reply" 2>/dev/null) || code=""
+  user_code=$(jq -r '.user_code // empty' <<<"$reply" 2>/dev/null) || true
+  uri=$(jq -r '.verification_uri // empty' <<<"$reply" 2>/dev/null) || true
+  interval=$(jq -r '.interval // 5' <<<"$reply" 2>/dev/null) || interval=5
+  expires=$(jq -r '.expires_in // 900' <<<"$reply" 2>/dev/null) || expires=900
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+  [[ "$expires" =~ ^[0-9]+$ ]] || expires=900
+  if [[ -z "$code" || -z "$user_code" ]]; then
+    printf 'agent.sh: GitHub did not start a sign-in: %s\n' \
+      "$(head -c 200 <<<"$reply")" >&2
+    return 1
+  fi
+  printf 'Open %s and enter the code: %s\n' \
+    "${uri:-$COPILOT_LOGIN_URL/login/device}" "$user_code" >&2
+  printf 'Waiting for you to approve it (Ctrl-C to cancel)...\n' >&2
+  INTERRUPTED=0
+  deadline=$(( $(date +%s) + expires ))
+  body=$(jq -cn --arg id "$COPILOT_CLIENT_ID" --arg d "$code" \
+    '{client_id: $id, device_code: $d,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code"}')
+  tok=""
+  while now=$(date +%s); (( now < deadline )); do
+    sleep "$interval" || true
+    if (( ${INTERRUPTED:-0} )); then
+      INTERRUPTED=0
+      printf 'agent.sh: sign-in cancelled\n' >&2; return 1
+    fi
+    # on stdin: the device code must not show in the process list
+    reply=$(curl -sS --connect-timeout 30 --max-time 60 "${hdrs[@]}" \
+      -d @- "$COPILOT_LOGIN_URL/login/oauth/access_token" \
+      2>/dev/null <<<"$body") || reply=""
+    tok=$(jq -r '.access_token // empty' <<<"$reply" 2>/dev/null) || tok=""
+    if [[ -n "$tok" ]]; then break; fi
+    err=$(jq -r '.error // empty' <<<"$reply" 2>/dev/null) || err=""
+    case "$err" in
+      authorization_pending|"") ;;
+      slow_down) interval=$((interval + 5)) ;;
+      expired_token) break ;;
+      access_denied)
+        printf 'agent.sh: the sign-in was denied\n' >&2; return 1 ;;
+      *) printf 'agent.sh: GitHub said: %s\n' "$err" >&2; return 1 ;;
+    esac
+  done
+  if [[ -z "$tok" ]]; then
+    printf 'agent.sh: the code expired before it was approved\n' >&2
+    return 1
+  fi
+  mkdir -p "$CONFIG_DIR" 2>/dev/null && chmod 700 "$CONFIG_DIR" 2>/dev/null ||
+    true
+  f="$CONFIG_DIR/auth.json"
+  (
+    umask 077
+    TOK="$tok" jq -n --slurpfile old <([[ -f "$f" ]] && cat "$f" || echo '{}') \
+      '(($old[0] // {}) | if type == "object" then . else {} end)
+       + {copilot: {oauth_token: $ENV.TOK}}' >"$f.new" &&
+      mv -f "$f.new" "$f"
+  ) || { printf 'agent.sh: cannot write %s\n' "$f" >&2; return 1; }
+  chmod 600 "$f" 2>/dev/null || true
+  printf 'Signed in to GitHub. The token is kept in %s\n' "$f" >&2
+  return 0
+}
+
+# /provider: the current provider and where its key came from
+provider_info() {
+  printf '  %-9s %s\n' provider "$PROVIDER"
+  printf '  %-9s %s\n' model "$MODEL"
+  printf '  %-9s %s\n' endpoint "$URL"
+  printf '  %-9s %s\n' key "${API_KEY_SOURCE:-unknown}"
+  echo "Switch with: /provider use <name> [model]   (/provider list)"
+}
+
+# /provider list: every provider this run can use, the current one marked
+provider_list() {
+  local n names="opencode copilot openai openrouter ollama" status seen=" "
+  names+="${PLUGIN_PROVIDERS% }"
+  local keep_name="$R_NAME"
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    names+=" $n"
+  done < <(cfg_provider_names)
+  for n in $names; do
+    [[ "$seen" == *" $n "* ]] && continue
+    seen+="$n "
+    if resolve_provider "$n" 0 2>/dev/null; then
+      status="ready, model $R_MODEL"
+    else
+      status="not ready: $R_ERR"
+    fi
+    if [[ "$n" == "$PROVIDER" ]]; then
+      printf '  \033[1m%-11s *  %s\033[0m\n' "$n" "$status"
+    else
+      printf '  %-11s    %s\n' "$n" "$status"
+    fi
+  done
+  R_NAME="$keep_name"
+  echo "Switch with: /provider use <name> [model]"
+}
+
+# /provider use NAME [MODEL]: switches the provider for this run. The model
+# does not carry over (ids differ between providers); the conversation does,
+# minus the reasoning text of the old model.
+provider_use() {
+  local name="${1:-}" model="${2:-}"
+  if [[ -z "$name" ]]; then
+    echo "Usage: /provider use <name> [model]   (/provider list)"
+    return 0
+  fi
+  if ! resolve_provider "$name" 0; then
+    printf 'agent.sh: %s\n' "$R_ERR" >&2
+    return 0
+  fi
+  if [[ -n "$model" ]]; then R_MODEL="$model"; fi
+  commit_provider
+  MESSAGES=$(jq -c 'map(del(.reasoning_content))' <<<"$MESSAGES")
+  : >"$TMP/models"
+  printf 'provider = %s, model = %s\n' "$PROVIDER" "$MODEL"
+  if [[ "$PKIND" != local ]] && [[ "$URL" != https://* ]]; then
+    printf 'warning: %s is not https; the key is sent unencrypted\n' \
+      "$URL" >&2
+  fi
 }
 
 # The endpoint that lists the models, derived from the chat endpoint
@@ -230,12 +973,14 @@ load_config_file() {
   fi
   v=$(config_get "$f" provider)
   if [[ -n "$v" ]]; then PROVIDER="$v"; fi
+  # model, url, api_key, reasoning and thinking at the top level belong to
+  # the provider the file names: load_settings applies them only to it
   v=$(config_get "$f" model)
-  if [[ -n "$v" ]]; then MODEL="$v"; fi
+  if [[ -n "$v" ]]; then CFG_MODEL="$v"; fi
   v=$(config_get "$f" url)
-  if [[ -n "$v" ]]; then URL="$v"; fi
+  if [[ -n "$v" ]]; then CFG_URL="$v"; fi
   v=$(config_get "$f" api_key)
-  if [[ -n "$v" ]]; then API_KEY="$v"; API_KEY_SOURCE="config"; fi
+  if [[ -n "$v" ]]; then CFG_API_KEY="$v"; fi
   # Web search: the environment wins over the file
   v=$(config_get "$f" brave_api_key)
   if [[ -n "$v" && -z "$BRAVE_KEY" ]]; then BRAVE_KEY="$v"; fi
@@ -245,16 +990,18 @@ load_config_file() {
   if [[ -n "$v" && -z "$SEARXNG_URL" ]]; then SEARXNG_URL="$v"; fi
   v=$(config_get "$f" reasoning)
   if [[ -n "$v" ]]; then
+    CFG_REASONING_SET=1
     case "$v" in
-      default|off|none) REASONING="" ;;
-      *) REASONING="$v" ;;
+      default|off|none) CFG_REASONING="" ;;
+      *) CFG_REASONING="$v" ;;
     esac
   fi
   v=$(config_get "$f" thinking)
   if [[ -n "$v" ]]; then
+    CFG_THINKING_SET=1
     case "$v" in
-      default|auto) THINKING="" ;;
-      *) THINKING="$v" ;;
+      default|auto) CFG_THINKING="" ;;
+      *) CFG_THINKING="$v" ;;
     esac
   fi
   v=$(config_get "$f" temperature)
@@ -268,39 +1015,44 @@ load_settings() {
   load_config_file "$CONFIG_FILE"
   if [[ -f "$CONFIG_FILE" ]]; then CONFIG_LOADED=1; fi
 
+  CFG_PROVIDER="$PROVIDER"
   if [[ -n "$PROVIDER_ENV_SET" ]]; then PROVIDER="$PROVIDER_ENV"; fi
-  if [[ -n "$URL_ENV_SET" ]]; then URL="$URL_ENV"; fi
-  if [[ -n "$MODEL_ENV_SET" ]]; then MODEL="$MODEL_ENV"; fi
-  if [[ -n "$REASONING_ENV_SET" ]]; then REASONING="$REASONING_ENV"; fi
+  if [[ "$(canon_provider "$CFG_PROVIDER")" == \
+        "$(canon_provider "$PROVIDER")" ]]; then
+    if [[ -n "$CFG_MODEL" ]]; then MODEL="$CFG_MODEL"; MODEL_GIVEN=1; fi
+    if [[ -n "$CFG_URL" ]]; then URL="$CFG_URL"; URL_GIVEN=1; fi
+    if [[ -n "$CFG_API_KEY" ]]; then
+      API_KEY="$CFG_API_KEY"; API_KEY_SOURCE="config"
+    fi
+    if (( CFG_REASONING_SET )); then
+      REASONING="$CFG_REASONING"; REASONING_GIVEN=1
+    fi
+    if (( CFG_THINKING_SET )); then THINKING="$CFG_THINKING"; fi
+  elif [[ -n "$CFG_MODEL$CFG_URL$CFG_API_KEY" ]] || (( CFG_REASONING_SET ||
+         CFG_THINKING_SET )); then
+    printf 'agent.sh: note: the model, url, api_key, reasoning and thinking' >&2
+    printf ' at the top of %s are for provider "%s", not "%s"; use' \
+      "$CONFIG_FILE" "$CFG_PROVIDER" "$PROVIDER" >&2
+    printf ' "providers" for more\n' >&2
+  fi
+  if [[ -n "$URL_ENV" ]]; then URL="$URL_ENV"; URL_GIVEN=1; fi
+  if [[ -n "$MODEL_ENV_SET" ]]; then MODEL="$MODEL_ENV"; MODEL_GIVEN=1; fi
+  if [[ -n "$REASONING_ENV_SET" ]]; then
+    REASONING="$REASONING_ENV"; REASONING_GIVEN=1
+  fi
   if [[ -n "$THINKING_ENV_SET" ]]; then THINKING="$THINKING_ENV"; fi
   if [[ -n "$TEMPERATURE_ENV_SET" ]]; then
     TEMPERATURE="$TEMPERATURE_ENV"
   fi
-  if [[ -n "$OPENCODE_API_KEY_ENV_SET" ]]; then
-    API_KEY="$OPENCODE_API_KEY_ENV"
-    API_KEY_SOURCE="env OPENCODE_API_KEY"
-  fi
-  if [[ -n "$AGENT_API_KEY_ENV_SET" ]]; then
-    API_KEY="$AGENT_API_KEY_ENV"
-    API_KEY_SOURCE="env AGENT_API_KEY"
-  fi
-  if [[ -z "$MODEL" ]]; then
+  if (( MODEL_GIVEN )) && [[ -z "$MODEL" ]]; then
     printf 'agent.sh: model must not be empty\n' >&2
     exit 2
   fi
-  if [[ -z "$API_KEY" ]]; then
-    printf '%s %s\n' \
-      'agent.sh: no API key: set AGENT_API_KEY or OPENCODE_API_KEY,' \
-      "or \"api_key\" in $CONFIG_FILE" >&2
+  if ! resolve_provider "$PROVIDER" 1; then
+    printf 'agent.sh: %s\n' "$R_ERR" >&2
     exit 2
   fi
-  if [[ -z "$URL" ]]; then
-    if ! URL=$(provider_url "$PROVIDER"); then
-      printf 'agent.sh: unknown provider "%s"; set "url" in %s\n' \
-        "$PROVIDER" "$CONFIG_FILE" >&2
-      exit 2
-    fi
-  fi
+  commit_provider
   # The API key travels in a header: say so if nothing encrypts it on the way
   case "$URL" in
     https://*|http://localhost[:/]*|http://127.0.0.1[:/]*|http://\[::1\]*) ;;
@@ -502,6 +1254,7 @@ usage() { sed -n '6,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; }
 
 # The current model settings (REPL: /model or /model info)
 model_info() {
+  printf '  %-11s %s\n' provider "$PROVIDER"
   printf '  %-11s %s\n' model "$MODEL"
   printf '  %-11s %s\n' reasoning "${REASONING:-server default}"
   printf '  %-11s %s\n' thinking "${THINKING:-server default}"
@@ -514,7 +1267,20 @@ model_info() {
   fi
   printf '  %-11s %s\n' endpoint "$URL"
   printf 'Change one with: /model set <model|reasoning|thinking|'\
-'temperature> <value>\n'
+'temperature|context|compact_at> <value>\n'
+}
+
+# /context: the window and where the history compacts (REPL: /context)
+context_info() {
+  if (( CONTEXT > 0 )); then
+    printf '  %-11s %s tokens\n' context "$CONTEXT"
+  else
+    printf '  %-11s unknown\n' context
+  fi
+  printf '  %-11s %s bytes%s\n' compact-at "$COMPACT_AT" \
+    "$( (( COMPACT_AT_AUTO )) && echo ' (follows the context)' || true)"
+  printf '  %-11s %s bytes\n' history "$(( ${#MESSAGES} ))"
+  echo "Change: /context <tokens|default>   /context compact <bytes|default>"
 }
 
 # /model set <key> <value>: validates and stores one setting for this run
@@ -525,11 +1291,11 @@ set_model() {
     effort) key=reasoning ;;
   esac
   case "$key" in
-    model|reasoning|thinking|temperature) ;;
-    "") echo "Usage: /model set <model|reasoning|thinking|temperature>"\
-             "<value>"; return 0 ;;
-    *)  echo "Unknown setting '$key' (model, reasoning, thinking or"\
-             "temperature)."; return 0 ;;
+    model|reasoning|thinking|temperature|context|compact_at) ;;
+    "") echo "Usage: /model set <model|reasoning|thinking|temperature|"\
+             "context|compact_at> <value>"; return 0 ;;
+    *)  echo "Unknown setting '$key' (model, reasoning, thinking,"\
+             "temperature, context or compact_at)."; return 0 ;;
   esac
   if [[ -z "$val" || -n "$rest" ]]; then
     printf 'Usage: /model set %s <value>\n' "$key"; return 0
@@ -561,19 +1327,56 @@ set_model() {
         printf 'Temperature must be a number from 0 to 2, or default.\n'
         return 0
       fi ;;
+    context)
+      # the window in tokens; compaction follows it unless COMPACT_AT was set
+      if [[ "$val" == default || "$val" == 0 ]]; then CONTEXT=0
+      elif [[ "$val" =~ ^[1-9][0-9]*$ ]]; then CONTEXT="$val"
+      else
+        echo "Context must be a number of tokens, or default (unknown)."
+        return 0
+      fi
+      if (( COMPACT_AT_AUTO )); then
+        if (( CONTEXT > 0 )); then COMPACT_AT=$(( CONTEXT * 2 ))
+        else COMPACT_AT=100000; fi
+      fi ;;
+    compact_at)
+      if [[ "$val" == default ]]; then
+        COMPACT_AT_AUTO=1
+        if (( CONTEXT > 0 )); then COMPACT_AT=$(( CONTEXT * 2 ))
+        else COMPACT_AT=100000; fi
+      elif [[ "$val" =~ ^[1-9][0-9]*$ ]]; then
+        COMPACT_AT="$val"; COMPACT_AT_AUTO=0
+      else
+        echo "compact_at must be a number of bytes, or default."
+        return 0
+      fi ;;
   esac
   case "$key" in
     model)       printf 'model = %s\n' "$MODEL" ;;
     reasoning)   printf 'reasoning = %s\n' "${REASONING:-server default}" ;;
     thinking)    printf 'thinking = %s\n' "${THINKING:-server default}" ;;
     temperature) printf 'temperature = %s\n' "${TEMPERATURE:-server default}" ;;
+    context|compact_at)
+      if (( CONTEXT > 0 )); then
+        printf 'context = %s tokens, compacts at %s bytes\n' "$CONTEXT" \
+          "$COMPACT_AT"
+      else
+        printf 'context = unknown, compacts at %s bytes\n' "$COMPACT_AT"
+      fi
+      if (( CONTEXT > 0 && COMPACT_AT >= CONTEXT * 4 )); then
+        echo "warning: compact_at reaches the context window; lower it"
+      fi ;;
   esac
 }
 
 # Fetches the endpoint's model list into $TMP/models, one id per line.
 # Explains a failure and returns non-zero; the current model is untouched.
 fetch_models() {
-  local url code
+  local url code note
+  if [[ "$PKIND" == copilot ]] && ! copilot_session; then
+    printf 'agent.sh: %s\n' "$COPILOT_LAST_ERR" >&2
+    return 1
+  fi
   ensure_tmp
   url=$(models_url)
   : >"$TMP/models"   # never resolve /model use against a stale list
@@ -585,9 +1388,12 @@ fetch_models() {
     printf 'agent.sh: cannot list models from %s%s\n' "$url" \
       "${code:+ (HTTP $code)}" >&2
     [[ -s "$TMP/curl.err" ]] && sed 's/^/  /' "$TMP/curl.err" >&2
+    note=$(reply_note "$TMP/models.json") || note=""
+    [[ -n "$note" ]] && printf '  the server said: %s\n' "$note" >&2
     return 1
   fi
   if ! jq -r '(.data // .models // [])[]
+               | select((.capabilities.type? // "chat") == "chat")
                | (.id // .name // empty)' "$TMP/models.json" \
        >"$TMP/models" 2>/dev/null || [[ ! -s "$TMP/models" ]]; then
     printf 'agent.sh: %s returned no model list\n' "$url" >&2
@@ -639,8 +1445,8 @@ model_use() {
   MODEL="$pick"
   printf 'model = %s\n' "$MODEL"
   if (( CONTEXT > 0 )); then
-    printf '(COMPACT_AT stays at %s bytes; set CONTEXT for the new model)\n' \
-      "$COMPACT_AT"
+    printf '(compacts at %s bytes still; for the new model: ' "$COMPACT_AT"
+    printf '/model set context <tokens>)\n'
   fi
 }
 
@@ -686,6 +1492,14 @@ about() {
   printf '  %-9s %s (outside it: %s)\n' workspace "${WORKSPACE:-$PWD}" \
     "$OUTSIDE"
   printf '  %-9s %s\n' tools "$TOOL_NAMES"
+  if [[ -n "$CLI_FOUND" ]]; then
+    printf '  %-9s %s%s\n' cli "$CLI_FOUND" \
+      "$( [[ "$CLI_HINTS" == 0 ]] && echo ' (not suggested: CLI_HINTS=0)')"
+  fi
+  if [[ -n "$PLUGIN_FILES" ]]; then
+    printf '  %-9s %s\n' plugins \
+      "$(sed 's|.*/||' <<<"$PLUGIN_FILES" | tr '\n' ' ')"
+  fi
   if (( WEB )); then
     if [[ -n "$BRAVE_KEY" ]]; then printf '  %-9s Brave\n' search
     elif [[ -n "$TAVILY_KEY" ]]; then printf '  %-9s Tavily\n' search
@@ -706,6 +1520,7 @@ about() {
 RESUME=""
 LIST=0
 INTERACTIVE=0
+LOGIN=""
 # getopts cannot see long options: take them out of the leading options first
 # and stop at the first prompt word, so "--plan" inside a prompt is just text.
 ARGS=()
@@ -715,6 +1530,13 @@ while (( $# )); do
     --version) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
     --plan)    ARGS+=(-p); shift ;;       # in order, so the last one wins
     --build)   ARGS+=(-b); shift ;;
+    --login)   LOGIN=copilot; shift          # the only login there is
+               case "${1:-}" in
+                 copilot|github-copilot) shift ;;
+                 ""|-*) ;;
+                 *) echo "agent.sh: cannot log in to '$1' (only copilot)" >&2
+                    exit 2 ;;
+               esac ;;
     --)        ARGS+=("$@"); break ;;
     --*)       echo "agent.sh: unknown option $1 (try -h)" >&2; exit 2 ;;
     -r|-[!-]*r)                         # -r takes the next word as its value
@@ -824,7 +1646,9 @@ done
 # With a known window, compact at half of it, counting 4 bytes per token, so
 # the summary request (the whole head plus the prompt) still fits. Without
 # one, keep the old byte threshold.
+COMPACT_AT_AUTO=0
 if [[ -z "$COMPACT_AT" ]]; then
+  COMPACT_AT_AUTO=1
   if (( CONTEXT > 0 )); then COMPACT_AT=$(( CONTEXT * 2 ))
   else COMPACT_AT=100000; fi
 fi
@@ -853,6 +1677,8 @@ SELF=$(resolve_self)
 INSTALL_DIR=$(dirname "$SELF")
 build_prompt_dirs
 init_config_dir
+load_plugins
+if [[ -n "$LOGIN" ]]; then copilot_login; exit; fi
 load_settings
 warn_config_permissions
 
@@ -917,6 +1743,68 @@ if [[ "$PROJECT_DOC" != 0 && -f AGENTS.md && -r AGENTS.md ]]; then
     PROJECT_DOC_USED="$PWD/AGENTS.md"
   fi
 fi
+# Fast command-line tools found on this machine, so the model reaches for
+# them instead of grep -r and find. CLI_HINTS=0 leaves this out.
+cli_tools() {
+  local t
+  CLI_FOUND=""; CLI_FD=""; CLI_BAT=""
+  for t in rg fzf ast-grep tree; do
+    command -v "$t" >/dev/null 2>&1 && CLI_FOUND+="$t "
+  done
+  # Debian and Ubuntu ship fd and bat under other names
+  for t in fd fdfind; do
+    if command -v "$t" >/dev/null 2>&1; then CLI_FD="$t"; break; fi
+  done
+  for t in bat batcat; do
+    if command -v "$t" >/dev/null 2>&1; then CLI_BAT="$t"; break; fi
+  done
+  [[ -z "$CLI_FD" ]] || CLI_FOUND+="$CLI_FD "
+  [[ -z "$CLI_BAT" ]] || CLI_FOUND+="$CLI_BAT "
+  CLI_FOUND=${CLI_FOUND% }
+}
+cli_hints() {
+  local h=""
+  [[ -n "$CLI_FOUND" ]] || return 0
+  h="Fast tools are installed here; use them in bash instead of the slower "
+  h+="classic ones (rg and fd skip .gitignore'd and hidden files by default):"
+  if [[ " $CLI_FOUND " == *" rg "* ]]; then
+    h+=$'
+'"- rg PATTERN [PATH]: search file contents instead of grep -r"
+    h+=" (rg -n -C2 for context, -l for file names, -t py to filter by"
+    h+=" type, -F for a literal string, --hidden/-uu to include ignored files)"
+  fi
+  if [[ -n "$CLI_FD" ]]; then
+    h+=$'
+'"- $CLI_FD PATTERN [PATH]: find files by name instead of find"
+    h+=" ($CLI_FD -e ts for an extension, -t f / -t d for files or"
+    h+=" directories, -H to include hidden ones)"
+  fi
+  if [[ " $CLI_FOUND " == *" fzf "* ]]; then
+    h+=$'
+'"- fzf --filter TEXT: fuzzy-match lines read on stdin, best first,"
+    h+=" for a file whose exact name you do not know (e.g."
+    if [[ -n "$CLI_FD" ]]; then h+=" $CLI_FD -t f | fzf --filter usrctl"
+    else h+=" rg --files | fzf --filter usrctl"; fi
+    h+=" | head). Never run fzf without --filter: there is no terminal."
+  fi
+  if [[ " $CLI_FOUND " == *" ast-grep "* ]]; then
+    h+=$'
+'"- ast-grep -p 'PATTERN' -l LANG: search code by syntax (e.g."
+    h+=" ast-grep -p 'console.log(\$A)' -l js); it ignores formatting"
+  fi
+  if [[ " $CLI_FOUND " == *" tree "* ]]; then
+    h+=$'
+'"- tree -L 2 --gitignore: the layout of a directory"
+  fi
+  # bat is for people: the read tool is better for the model, so no hint
+  printf '%s' "$h"
+}
+CLI_HINTS="${CLI_HINTS:-1}"
+cli_tools
+if [[ "$CLI_HINTS" != 0 ]]; then
+  hints=$(cli_hints)
+  if [[ -n "$hints" ]]; then BASE_SYSTEM+=$'\n\n'"$hints"; fi
+fi
 PLAN_PROMPT=$(read_prompt PLAN.md "$PLAN_DEFAULT")
 EXPLORE_DEFAULT='You are an explorer: a read-only sub-agent working for '
 EXPLORE_DEFAULT+='another agent, which gave you the task below and cannot see '
@@ -933,7 +1821,15 @@ SYSTEM="$BASE_SYSTEM"
 # OpenAI-style tool definitions. An explorer gets bash and read only.
 # Built with jq: a JSON string cannot be broken across lines
 TOOLS=$(jq -cn --argjson explore "$SUBAGENTS" --argjson web "$WEB" \
-              --argjson sub "$SUB" --argjson lines "$READ_LINES" '
+              --argjson sub "$SUB" --argjson lines "$READ_LINES" \
+              --arg search "$(
+                if [[ " $CLI_FOUND " == *" rg "* ]]; then printf 'rg'
+                else printf 'grep -rn'; fi
+                if [[ -n "$CLI_FD" ]]; then printf ', %s' "$CLI_FD"
+                else printf ', find'; fi
+                printf ', ls')" \
+              --argjson plugin_tools "$(if (( SUB )); then echo '[]'
+                               else echo "$PLUGIN_TOOLS_JSON"; fi)" '
   def tool(n; d; props; req):
     {type: "function", function: {name: n, description: d,
       parameters: {type: "object", properties: props, required: req}}};
@@ -942,7 +1838,7 @@ TOOLS=$(jq -cn --argjson explore "$SUBAGENTS" --argjson web "$WEB" \
      + "stdout and stderr, plus the exit code if it is not 0. Each call is a "
      + "new non-interactive shell: nothing carries over, and there is no "
      + "terminal or stdin. Use it to run builds, tests, git and any other "
-     + "program, and to search (grep -rn, find, ls).";
+     + "program, and to search (\($search)).";
      {command: {type: "string",
                 description: "The bash command or script to run"}};
      ["command"]),
@@ -1008,7 +1904,8 @@ TOOLS=$(jq -cn --argjson explore "$SUBAGENTS" --argjson web "$WEB" \
      {task: {type: "string",
              description: "What the explorer should find out and report"}};
      ["task"])]
-  else [] end)')
+  else [] end)
+  + $plugin_tools')
 TOOL_NAMES=$(jq -r '[.[].function.name] | join(", ")' <<<"$TOOLS")
 
 # Scratch files live beside the sessions, not in /tmp: a command that cleans
@@ -1039,9 +1936,7 @@ if (( SUB )); then trap 'exit 143' TERM; fi
 # with ps. printf is a builtin, so it does not show up there either.
 ensure_tmp() {
   [[ -d "$TMP" ]] || mkdir -p "$TMP" 2>/dev/null || true
-  [[ -s "$TMP/auth" ]] ||
-    printf 'Authorization: Bearer %s\n' "$API_KEY" >"$TMP/auth" 2>/dev/null ||
-    true
+  [[ -s "$TMP/auth" ]] || write_auth
 }
 ensure_tmp
 # "timeout" caps a command's run time where it exists (gtimeout: macOS with
@@ -1067,11 +1962,34 @@ trap 'INTERRUPTED=1' INT
 
 session_file() { printf '%s/%s.json' "$SESSION_DIR" "$SESSION_ID"; }
 
+# Some models are served only by the /responses API. RESP_MODELS lists the
+# "provider/model" pairs known to need it (learned when /chat/completions
+# refuses one and /responses takes it; an explorer inherits the list).
+uses_responses() { [[ " $RESP_MODELS " == *" $PROVIDER/$MODEL "* ]]; }
+
+# The settings a conversation was held with, saved beside it. Never the key
+# or the URL: those come from where the session is resumed.
+settings_json() {
+  local api=chat
+  if uses_responses; then api=responses; fi
+  jq -cn --arg provider "$PROVIDER" --arg model "$MODEL" --arg api "$api" \
+    --arg reasoning "$REASONING" --arg thinking "$THINKING" \
+    --arg temperature "$TEMPERATURE" --arg context "$CONTEXT" \
+    --arg compact_at "$(if (( COMPACT_AT_AUTO )); then echo auto
+                        else echo "$COMPACT_AT"; fi)" \
+    '{provider: $provider, model: $model, api: $api, reasoning: $reasoning,
+      thinking: $thinking, temperature: $temperature,
+      context: ($context | tonumber), compact_at: $compact_at}'
+}
+
 save_session() {
-  local f; f=$(session_file)
+  local f settings; f=$(session_file)
+  settings=$(settings_json)
+  LAST_SETTINGS="$settings"
   [[ -d "$SESSION_DIR" ]] || mkdir -p "$SESSION_DIR" 2>/dev/null || true
   if ! jq -c --arg id "$SESSION_ID" --arg cwd "$PWD" \
-         '{id: $id, cwd: $cwd, messages: .}' \
+         --argjson settings "$settings" \
+         '{id: $id, cwd: $cwd, settings: $settings, messages: .}' \
          <<<"$MESSAGES" >"$f.$$.tmp" 2>/dev/null ||
      ! mv -f "$f.$$.tmp" "$f"; then
     echo "warning: could not save session to $f" >&2
@@ -1142,7 +2060,92 @@ resolve_session() {
   esac
 }
 
-# Switches to a saved session; the current one is already saved
+# Saves the session again if a command (/model, /provider, /reasoning, ...)
+# changed its settings since the last save
+sync_settings() {
+  if [[ -f "$(session_file)" && "$(settings_json)" != "${LAST_SETTINGS-}" ]]
+  then save_session; fi
+  return 0
+}
+
+# Puts back the settings a session was saved with. $1 is "start" for a run
+# that began with -c or -r: what the environment set then is kept.
+restore_settings() {
+  local from="$1" s p m api r t th cx ca keep_p=0 keep_m=0 keep_r=0 keep_t=0
+  local keep_th=0 keep_cx=0 keep_ca=0 note="" X=$'\x1f'
+  local f="$SESSION_DIR/$SESSION_ID.json"
+  s=$(jq -c '.settings // empty | if type == "object" then . else empty end' \
+        "$f" 2>/dev/null) || s=""
+  [[ -n "$s" ]] || return 0
+  IFS=$X read -r p m api r t th cx ca < <(jq -r '
+    def f($k): if has($k) then (.[$k] | tostring) else "@@" end;
+    [f("provider"), f("model"), f("api"), f("reasoning"),
+     f("temperature"), f("thinking"), f("context"), f("compact_at")]
+    | join("\u001f")' <<<"$s") || true
+  if [[ "$from" == start ]]; then
+    [[ -n "$PROVIDER_ENV_SET" ]] && keep_p=1
+    [[ -n "$MODEL_ENV_SET" ]] && keep_m=1
+    [[ -n "$REASONING_ENV_SET" ]] && keep_r=1
+    [[ -n "$TEMPERATURE_ENV_SET" ]] && keep_t=1
+    [[ -n "$THINKING_ENV_SET" ]] && keep_th=1
+    [[ -n "$CONTEXT_ENV_SET" ]] && keep_cx=1
+    [[ -n "$COMPACT_AT_ENV_SET" ]] && keep_ca=1
+  fi
+  if [[ "$p" != "@@" && -n "$p" && "$p" != "$PROVIDER" ]] &&
+     (( ! keep_p )); then
+    if resolve_provider "$p" 0; then
+      if (( keep_m )); then R_MODEL="$MODEL"
+      elif [[ "$m" != "@@" && -n "$m" ]]; then R_MODEL="$m"; fi
+      if (( keep_r )); then R_REASONING="$REASONING"; fi
+      commit_provider
+      MESSAGES=$(jq -c 'map(del(.reasoning_content))' <<<"$MESSAGES")
+      : >"$TMP/models"
+      note+=", provider $PROVIDER"
+      m="@@"
+    else
+      printf 'agent.sh: cannot go back to provider "%s": %s\n' \
+        "$p" "$R_ERR" >&2
+      printf '  staying on %s; its model and settings are not restored\n' \
+        "$PROVIDER" >&2
+      return 0
+    fi
+  fi
+  if [[ "$m" != "@@" && -n "$m" ]] && (( ! keep_m )); then MODEL="$m"; fi
+  # a session file is data: only values the commands would accept come back
+  if [[ "$r" =~ ^(|minimal|low|medium|high)$ ]] && (( ! keep_r )); then
+    REASONING="$r"
+  fi
+  if [[ "$t" =~ ^(|[0-9]+(\.[0-9]+)?)$ ]] && (( ! keep_t )); then
+    TEMPERATURE="$t"
+  fi
+  if [[ "$th" =~ ^(|on|off)$ ]] && (( ! keep_th )); then THINKING="$th"; fi
+  if [[ "$cx" =~ ^[0-9]+$ ]] && (( ! keep_cx )); then CONTEXT="$cx"; fi
+  if [[ "$ca" == auto ]] && (( ! keep_ca )); then
+    COMPACT_AT_AUTO=1
+    if (( CONTEXT > 0 )); then COMPACT_AT=$(( CONTEXT * 2 ))
+    else COMPACT_AT=100000; fi
+  elif [[ "$ca" =~ ^[1-9][0-9]*$ ]] && (( ! keep_ca )); then
+    COMPACT_AT="$ca"; COMPACT_AT_AUTO=0
+  fi
+  if [[ "$api" == responses ]] && ! uses_responses; then
+    RESP_MODELS="$RESP_MODELS $PROVIDER/$MODEL"
+  elif [[ "$api" == chat ]] && uses_responses; then
+    RESP_MODELS=" $RESP_MODELS "
+    RESP_MODELS=${RESP_MODELS// $PROVIDER\/$MODEL / }
+  fi
+  note="model $MODEL${note}"
+  if uses_responses; then note+=", /responses"; fi
+  if [[ -n "$REASONING" ]]; then note+=", reasoning $REASONING"; fi
+  if [[ -n "$THINKING" ]]; then note+=", thinking $THINKING"; fi
+  if [[ -n "$TEMPERATURE" ]]; then note+=", temperature $TEMPERATURE"; fi
+  if (( CONTEXT > 0 )); then note+=", context $CONTEXT"; fi
+  note+=", compacts at $COMPACT_AT bytes"
+  printf '  settings: %s\n' "$note" >&2
+  LAST_SETTINGS=$(settings_json)
+}
+
+# Switches to a saved session; the current one is already saved.
+# $2 is "start" when this is the -c/-r of the command line.
 load_session() {
   local id msgs n
   id=$(resolve_session "$1") || return 1
@@ -1162,6 +2165,7 @@ load_session() {
   SESSION_ID="$id"
   n=$(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES")
   echo "Resumed session $SESSION_ID ($n user messages)" >&2
+  restore_settings "${2:-}"
   # Remind the user where the conversation left off
   jq -r '[.[] | select(.role == "assistant" and (.content // "") != "")
           | .content] | last // empty
@@ -1176,7 +2180,7 @@ if [[ -n "$RESUME" ]]; then
     RESUME=$(find_last_session) ||
       { echo "agent.sh: no saved session for $PWD" >&2; exit 1; }
   fi
-  load_session "$RESUME" || exit 1
+  load_session "$RESUME" start || exit 1
 else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
   # It becomes a file name and a request header
@@ -1284,53 +2288,243 @@ assemble() { jq -Rn --argjson partial "${1:-false}" "$ASSEMBLE" <"$TMP/sse"; }
 
 # One HTTP call: the request body on stdin, the SSE stream on stdout, the status
 # line in $TMP/hdr
+# POSTs the request body on stdin to $1
 http_post() {
+  local -a PKIND_HDR=()
+  if [[ "$PKIND" == opencode ]]; then
+    PKIND_HDR=(-H "x-opencode-session: $SESSION_ID")
+  fi
   curl -sSN --connect-timeout 30 --speed-limit 1 --speed-time "$TIMEOUT" \
-    -D "$TMP/hdr" "$URL" \
+    -D "$TMP/hdr" "$1" \
     -H @"$TMP/auth" \
     -H "Content-Type: application/json" \
     -H "Accept: text/event-stream" \
-    -H "x-opencode-session: $SESSION_ID" \
+    ${PKIND_HDR[@]+"${PKIND_HDR[@]}"} \
     -d @-
+}
+
+# The /responses endpoint beside $URL, if $URL ends in /chat/completions
+responses_url() {
+  [[ "$URL" == */chat/completions ]] || return 1
+  printf '%s/responses\n' "${URL%/chat/completions}"
+}
+
+# True if the error body in $TMP/sse says the model is not served by the
+# endpoint it was sent to. $1 is the HTTP code, $2 "chat" or "responses".
+wrong_endpoint() {
+  local code="$1" which="$2" msg
+  [[ "$code" =~ ^(400|404|422)$ ]] || return 1
+  msg=$(jq -r '(.error // .) | if type == "object" then (.message // "")
+               elif type == "string" then . else "" end' "$TMP/sse" \
+        2>/dev/null) || return 1
+  if [[ "$which" == chat ]]; then
+    [[ "$msg" == *"/chat/completions"* ]] &&
+      [[ "$msg" == *"not accessible"* || "$msg" == *"not supported"* ||
+         "$msg" == *"only supported"* || "$msg" == *"not a chat model"* ]]
+  else
+    [[ "$msg" == *"/responses"* || "$msg" == *"not a chat model"* ]] &&
+      [[ "$msg" == *"not accessible"* || "$msg" == *"not supported"* ||
+         "$msg" == *"unsupported"* || "$msg" == *"not found"* ]]
+  fi
+}
+
+# The request body for the /responses API: $1 is 1 for no tools, $2 a chat
+# messages array. System messages become "instructions", the rest "input".
+responses_body() {
+  jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
+    --argjson notools "$1" --arg reasoning "$REASONING" \
+    --arg temperature "$TEMPERATURE" '
+    . as $m
+    | {model: $model,
+       instructions: ([$m[] | select(.role == "system")
+                       | (.content | if type == "array"
+                          then map(.text? // "") | join("") else . // "" end)]
+                      | join("\n\n")),
+       input: [$m[] | select(.role != "system")
+         | if .role == "tool" then
+             {type: "function_call_output", call_id: .tool_call_id,
+              output: (.content | if type == "string" then .
+                       else tojson end)}
+           elif .role == "assistant" then
+             (if ((.content // "") | tostring) != "" then
+                {role: "assistant", content: .content} else empty end),
+             ((.tool_calls // [])[]
+              | {type: "function_call", call_id: .id,
+                 name: .function.name, arguments: .function.arguments})
+           else {role: .role, content: .content} end],
+       stream: true, store: false}
+    + (if $reasoning == "" then {}
+       else {reasoning: {effort: $reasoning}} end)
+    + (if $temperature == "" then {}
+       else {temperature: ($temperature | tonumber)} end)
+    + (if $notools == 1 then {}
+       else {tools: [$tools[] | {type: "function", name: .function.name,
+                                 description: .function.description,
+                                 parameters: .function.parameters,
+                                 strict: false}]} end)' <<<"$2"
+}
+
+# Turns a /responses event stream (stdin) into chat-completion chunks, so the
+# rest of the agent sees one format. Anything that is not an event (a plain
+# JSON error body) passes through as it is.
+resp2chat() {
+  jq -nRr --unbuffered '
+    def chunk($d; $f): {choices: [{index: 0, delta: $d, finish_reason: $f}]};
+    def line: "data: " + tojson;
+    foreach inputs as $raw
+      ({n: 0, map: {}, args: {}, out: [], calls: 0};
+       .out = []
+       | ($raw | sub("\r$"; "")) as $l
+       | if $l == "" or ($l | startswith("event:")) then .
+         elif ($l | startswith("data:") | not) then .out = [$l]
+         else
+           (try ($l | sub("^data: ?"; "") | fromjson) catch null) as $e
+           | if $e == null then .
+             elif $e.type == "response.output_text.delta" then
+               .out = [chunk({content: $e.delta}; null) | line]
+             elif ($e.type == "response.reasoning_summary_text.delta"
+                   or $e.type == "response.reasoning_text.delta") then
+               .out = [chunk({reasoning_content: $e.delta}; null) | line]
+             elif ($e.type == "response.output_item.added"
+                   and $e.item.type == "function_call") then
+               .n as $i
+               | .map[$e.item.id // $e.item.call_id] = $i
+               | .n += 1 | .calls += 1
+               | .out = [chunk({tool_calls: [{index: $i,
+                   id: $e.item.call_id, type: "function",
+                   function: {name: $e.item.name, arguments: ""}}]}; null)
+                   | line]
+             elif $e.type == "response.function_call_arguments.delta" then
+               (.map[$e.item_id] // 0) as $i
+               | .args[$i | tostring] = true
+               | .out = [chunk({tool_calls: [{index: $i,
+                   function: {arguments: $e.delta}}]}; null) | line]
+             elif ($e.type == "response.output_item.done"
+                   and $e.item.type == "function_call") then
+               (.map[$e.item.id // $e.item.call_id] // 0) as $i
+               | if .args[$i | tostring] then .
+                 else .out = [chunk({tool_calls: [{index: $i,
+                   function: {arguments: $e.item.arguments}}]}; null)
+                   | line] end
+             elif $e.type == "response.completed" then
+               .out = [(chunk({}; (if .calls > 0 then "tool_calls"
+                                   else "stop" end)) | line), "data: [DONE]"]
+             elif $e.type == "response.incomplete" then
+               .out = [(chunk({}; "length") | line), "data: [DONE]"]
+             elif ($e.type == "response.failed" or $e.type == "error") then
+               ($e.response.error // $e.error // $e) as $x
+               | .out = [{error: {message: ($x.message // ($x | tojson))}}
+                         | tojson]
+             else . end
+         end;
+       .out[])'
 }
 
 # Sends $1 (a messages array), leaves the raw stream in $TMP/sse. $2 is a list
 # of flags: "quiet" keeps the reply off the screen, otherwise it is streamed as
 # it arrives; "notools" sends no tool definitions, so the reply is text.
 # Retries only when nothing arrived or the server asks to retry, never after
-# part of a reply was already shown.
+# part of a reply was already shown. A model that /chat/completions refuses
+# is tried once on /responses; if that refuses it too, the error stands.
+# A /responses reply is converted to chat chunks before it lands in $TMP/sse.
 request() {
   local msgs="$1" flags=" ${2:-} " attempt code body notools=0
+  local pass api rurl="" first
+  [[ -d "$TMP" ]] || mkdir -p "$TMP" 2>/dev/null || true
+  if [[ "$PKIND" == copilot ]] && ! copilot_session; then
+    # leave the reason where the reply would be, so the caller reports it
+    jq -cn --arg m "$COPILOT_LAST_ERR" '{error: {message: $m}}' >"$TMP/sse"
+    : >"$TMP/hdr"
+    return 0
+  fi
+  if [[ "$PLUGIN_PROVIDERS" == *" $PROVIDER "* ]] &&
+     declare -F "provider_${PROVIDER}_prepare" >/dev/null; then
+    PLUGIN_ERR=""
+    if ! plugin_call "provider_${PROVIDER}_prepare"; then
+      jq -cn --arg m "${PLUGIN_ERR:-provider $PROVIDER could not prepare}" \
+        '{error: {message: $m}}' >"$TMP/sse"
+      : >"$TMP/hdr"
+      return 0
+    fi
+    rm -f "$TMP/auth"            # the key or headers may have changed
+  fi
   ensure_tmp
   if [[ "$flags" == *" notools "* ]]; then notools=1; fi
-  body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-    --argjson notools "$notools" --arg reasoning "$REASONING" \
-    --arg thinking "$THINKING" --arg temperature "$TEMPERATURE" \
-    '{model: $model}
-     + (if $reasoning == "" then {} else {reasoning_effort: $reasoning} end)
-     + (if $thinking == "" then {}
-        else {thinking: {type: (if $thinking == "on" then "enabled"
-                                 else "disabled" end)}} end)
-     + (if $temperature == "" then {}
-        else {temperature: ($temperature | tonumber)} end)
-     + {messages: ., stream: true}
-     + (if $notools == 1 then {} else {tools: $tools} end)' <<<"$msgs")
-  for attempt in 1 2 3 4; do
-    : >"$TMP/sse"; : >"$TMP/hdr"
-    if [[ "$flags" == *" quiet "* ]]; then
-      printf '%s' "$body" | http_post | tee "$TMP/sse" >/dev/null || true
+  api=chat
+  if uses_responses && rurl=$(responses_url); then api=responses; fi
+  first="$api"
+  for pass in 1 2; do
+    if [[ "$api" == chat ]]; then
+      body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
+        --argjson notools "$notools" --arg reasoning "$REASONING" \
+        --arg thinking "$THINKING" --arg temperature "$TEMPERATURE" \
+        '{model: $model}
+         + (if $reasoning == "" then {} else {reasoning_effort: $reasoning} end)
+         + (if $thinking == "" then {}
+            else {thinking: {type: (if $thinking == "on" then "enabled"
+                                     else "disabled" end)}} end)
+         + (if $temperature == "" then {}
+            else {temperature: ($temperature | tonumber)} end)
+         + {messages: ., stream: true}
+         + (if $notools == 1 then {} else {tools: $tools} end)' <<<"$msgs")
     else
-      printf '%s' "$body" | http_post | tee "$TMP/sse" | show_stream || true
+      body=$(responses_body "$notools" "$msgs")
     fi
-    (( INTERRUPTED )) && return 0
-    code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
-    [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]] && return 0
-    (( attempt < 4 )) || return 0
-    printf '(request failed%s; retrying in %ss...)\n' \
-      "${code:+, HTTP $code}" $((attempt * 2)) >&2
-    sleep $((attempt * 2)) || true
-    (( INTERRUPTED )) && return 0
+    for attempt in 1 2 3 4; do
+      : >"$TMP/sse"; : >"$TMP/hdr"
+      if [[ "$api" == chat ]]; then
+        if [[ "$flags" == *" quiet "* ]]; then
+          printf '%s' "$body" | http_post "$URL" | tee "$TMP/sse" >/dev/null \
+            || true
+        else
+          printf '%s' "$body" | http_post "$URL" | tee "$TMP/sse" \
+            | show_stream || true
+        fi
+      elif [[ "$flags" == *" quiet "* ]]; then
+        printf '%s' "$body" | http_post "$rurl" | resp2chat \
+          | tee "$TMP/sse" >/dev/null || true
+      else
+        printf '%s' "$body" | http_post "$rurl" | resp2chat \
+          | tee "$TMP/sse" | show_stream || true
+      fi
+      (( INTERRUPTED )) && return 0
+      code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
+      if [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
+        break
+      fi
+      if (( attempt == 4 )); then break; fi
+      printf '(request failed%s; retrying in %ss...)\n' \
+        "${code:+, HTTP $code}" $((attempt * 2)) >&2
+      sleep $((attempt * 2)) || true
+      (( INTERRUPTED )) && return 0
+    done
+    if [[ "$api" == chat ]] && (( pass == 1 )) &&
+       wrong_endpoint "$code" chat && rurl=$(responses_url); then
+      printf '(%s is not served by /chat/completions; trying /responses)\n' \
+        "$MODEL" >&2
+      api=responses
+      continue
+    fi
+    # remember a model that /responses took, so later prompts go straight there
+    if [[ "$api" == responses && "$code" =~ ^2[0-9][0-9]$ ]] &&
+       ! uses_responses; then
+      RESP_MODELS="$RESP_MODELS $PROVIDER/$MODEL"
+    elif [[ "$api" == responses ]] && wrong_endpoint "$code" responses; then
+      # /responses does not take it: forget what was learned or restored
+      RESP_MODELS=" $RESP_MODELS "
+      RESP_MODELS=${RESP_MODELS// $PROVIDER\/$MODEL / }
+      if [[ "$first" == responses ]] && (( pass == 1 )); then
+        # it was only remembered as a /responses model: chat was not tried
+        printf '(%s is not served by /responses; trying /chat/completions)\n' \
+          "$MODEL" >&2
+        api=chat
+        continue
+      fi
+      # neither endpoint takes it: the error is shown as it is
+    fi
+    return 0
   done
+  return 0
 }
 
 # An explorer's replies stay off the screen: only its report is printed
@@ -1440,7 +2634,8 @@ PLAN_CMDS=(ls cat head tail wc grep egrep fgrep rg find file stat pwd echo
            printf cut tr diff comm cmp jq basename dirname readlink realpath
            du df which type uname date id ps seq nl od strings paste join
            expand unexpand fold tac rev sort tree md5sum sha1sum sha256sum
-           sha512sum cksum test true false '[' '[[' ']]' : cd)
+           sha512sum cksum test true false '[' '[[' ']]' : cd
+           fd fdfind fzf ast-grep bat batcat)
 PLAN_WORDS=()                          # filled by plan_split
 PLAN_SEP=$'\n'                         # entry that ends a simple command
 PLAN_NULL_RE='^>(&[12]|/dev/null)([[:space:];|&]|$)'
@@ -1586,6 +2781,32 @@ plan_simple_ok() {
           done ;;
     rg)   for a; do
             case "$a" in --pre*|--hostname-bin*) return 1 ;; esac
+          done ;;
+    fd|fdfind)                          # runs a program for every match
+          for a; do
+            case "$a" in -x|-X|--exec*|-[!-]*[xX]*) return 1 ;; esac
+          done ;;
+    fzf)  # without --filter it waits for a terminal; --bind and --preview
+          # run programs, --listen opens a port
+          c=0
+          for a; do
+            case "$a" in
+              -f*|--filter*) c=1 ;;
+              --bind*|--preview*|--listen*|--with-shell*|--history*) return 1 ;;
+              --execute*|--become*) return 1 ;;
+            esac
+          done
+          (( c )) || return 1 ;;
+    ast-grep)                           # rewrites files in place
+          [[ "${1:-}" != new ]] || return 1
+          for a; do
+            case "$a" in
+              -U|--update-all|-i|--interactive|-[!-]*U*) return 1 ;;
+            esac
+          done ;;
+    bat|batcat)                         # a pager could run a program
+          for a; do
+            case "$a" in --pager*|--paging=always) return 1 ;; esac
           done ;;
   esac
   for c in "${PLAN_CMDS[@]}"; do
@@ -1781,8 +3002,11 @@ outside_paths() {
     [[ "$p" =~ $PATH_RE ]] || continue
     norm_path "$p"
     p=$NORM
-    case "$p/" in "$WORKSPACE"/*|"$START_DIR"/*) continue ;; esac
-    if [[ "$WORKSPACE" == / ]]; then continue; fi
+    case "$p/" in
+      "${CONFIG_DIR%/}"/*) ;;            # the agent's own files: always ask
+      "$WORKSPACE"/*|"$START_DIR"/*) continue ;;
+      *) if [[ "$WORKSPACE" == / ]]; then continue; fi ;;
+    esac
     # "/api/v1" in a grep is not a file: an absolute path counts only if its
     # first part exists (a wildcard there may match anything)
     if [[ "$w" == /* && "$p" != / ]]; then
@@ -1843,6 +3067,9 @@ risky_cmds() {
 # workspace or in one of the locations in OUTSIDE_ALLOW
 path_is_free() {
   local a
+  # The agent's own files (keys, sign-in token, plugins that run as code)
+  # are never free, even when the workspace holds them
+  case "$1/" in "${CONFIG_DIR%/}"/*) return 1 ;; esac
   case "$1/" in "$WORKSPACE"/*|"$START_DIR"/*) return 0 ;; esac
   if [[ "$WORKSPACE" == / ]]; then return 0; fi
   for a in "${OUTSIDE_ALLOW[@]}"; do
@@ -2501,7 +3728,11 @@ other_tool() {
   if (( SUB )); then exec 9>/dev/null; else exec 9>&2; fi
   ensure_tmp
   TOOL_OUT=""
-  "tool_$1" "$2" || true
+  if [[ ", $PLUGIN_TOOLS_NAMES, " == *", $1, "* ]]; then
+    plugin_tool_run "$1" "$2"
+  else
+    "tool_$1" "$2" || true
+  fi
   exec 9>&-
   [[ -n "$TOOL_OUT" ]] || TOOL_OUT="(no output)"
 }
@@ -2532,6 +3763,9 @@ sub_kill_all() {
 sub_start() {
   local n="$1" task line
   task=$(cat "$SUB_DIR/$n.task")
+  if [[ "$PKIND" == copilot ]]; then
+    copilot_session $((SUB_TIMEOUT + 60)) || true   # an explorer cannot renew
+  fi
   line=${task%%$'\n'*}
   if (( ${#line} > 100 )); then line="${line:0:100}..."; fi
   printf '\033[33m[explorer %s] %s\033[0m\n' "$n" "$line" >&2
@@ -2539,6 +3773,7 @@ sub_start() {
     umask "$ORIG_UMASK"
     # The key and the settings of this run go by environment, not argv
     export AGENT_SUB=1 AGENT_SUB_NAME="explorer $n" AGENT_API_KEY="$API_KEY"
+    export AGENT_RESPONSES_MODELS="$RESP_MODELS"
     export MODEL PROVIDER URL REASONING THINKING TEMPERATURE MAX_OUT TIMEOUT
     export CMD_TIMEOUT SUB_MAX_STEPS PROJECT_DOC AUTO_COMPACT COMPACT_AT
     export OUTSIDE WORKSPACE ALLOW_PATHS ASK_CMDS READ_LINES
@@ -2623,7 +3858,7 @@ ARG='(.function.arguments | if type == "string" then fromjson? else . end)'
 # TURN_OK is 0 afterwards if the turn failed or was interrupted.
 TURN_OK=1
 run_turn() {
-  local result msg call id name cmd out n ncalls steps=0 args
+  local result msg call id name cmd out n ncalls steps=0 args errtext blocked
   TURN_OK=1
   while true; do
     INTERRUPTED=0
@@ -2645,9 +3880,10 @@ run_turn() {
     result=$(assemble)
     if ! msg=$(jq -ce '.message // empty' <<<"$result"); then
       echo "API error:" >&2
-      jq -r '(.error // "(no response)")
+      errtext=$(jq -r '(.error // "(no response)")
              | if type == "object" then (.message // tojson) else . end
-             | if . == "" then "(no response)" else . end' <<<"$result" >&2
+             | if . == "" then "(no response)" else . end' <<<"$result")
+      printf '%s\n' "$errtext" >&2
       abort_turn
       TURN_OK=0
       return
@@ -2708,6 +3944,10 @@ run_turn() {
       elif [[ ", $TOOL_NAMES, " != *", $name, "* ]]; then
         out="Error: unknown tool '$name'. The tools are: $TOOL_NAMES."
         printf '%s\n' "$out" >&2
+      elif ! blocked=$(plugin_tool_allowed "$name" "$args" 9>&2); then
+        out="Not run: a plugin blocked this call"
+        out+="${blocked:+: $blocked}."
+        printf '\033[33m%s\033[0m\n' "$out" >&2
       elif [[ "$name" != bash ]]; then      # read, write, edit, web_*
         other_tool "$name" "$args"
         out="$TOOL_OUT"
@@ -2832,6 +4072,7 @@ fi
 [[ -f "$AGENT_HISTFILE" ]] && chmod 600 "$AGENT_HISTFILE" 2>/dev/null || true
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
 
+plugin_hooks start
 input="$FIRST_PROMPT"
 while true; do
   if [[ -z "$input" ]]; then
@@ -2866,6 +4107,20 @@ while true; do
               if load_session "$arg"; then apply_mode "$MODE"; fi
             fi ;;
     /about) about ;;
+    /provider|"/provider info") provider_info ;;
+    "/provider list") provider_list ;;
+    "/provider use"|"/provider use "*)
+            read -r arg rest extra <<<"${input#/provider use}" || true
+            if [[ -n "${extra:-}" ]]; then
+              echo "Usage: /provider use <name> [model]"
+            else
+              provider_use "${arg:-}" "${rest:-}"
+            fi ;;
+    "/provider "*) echo "Usage: /provider [info|list] |"\
+                        "/provider use <name> [model]" ;;
+    /login|"/login copilot"|"/login github-copilot")
+            if copilot_login; then provider_use copilot; fi ;;
+    "/login "*) echo "Usage: /login copilot" ;;
     /model|"/model info") model_info ;;
     "/model list") model_list ;;
     "/model use"|"/model use "*)
@@ -2875,6 +4130,13 @@ while true; do
             else
               model_use "${arg:-}"
             fi ;;
+    /context|"/context info") context_info ;;
+    "/context compact"|"/context compact "*)
+            read -r val rest _ <<<"${input#/context compact}" || true
+            set_model compact_at "${val:-}" "${rest:-}" ;;
+    "/context "*)
+            read -r val rest _ <<<"${input#/context}" || true
+            set_model context "${val:-}" "${rest:-}" ;;
     "/model set"|"/model set "*)
             read -r key val rest _ <<<"${input#/model set}" || true
             set_model "${key:-}" "${val:-}" "${rest:-}" ;;
@@ -2901,6 +4163,11 @@ while true; do
               echo "Build mode: commands run and files can change."
             fi ;;
     /help)  echo "/about           version, author, model and session details"
+            echo "/provider list   the providers you can use (current one"\
+                 "marked)"
+            echo "/provider use N  switch provider (and optionally its"\
+                 "model): /provider use copilot gpt-4.1"
+            echo "/login copilot   sign in to GitHub Copilot"
             echo "/model list      list the endpoint's models (current one"\
                  "marked)"
             echo "/model use ID    switch by number or name for this run"
@@ -2908,6 +4175,10 @@ while true; do
                  "thinking, temperature"
             echo "                 (/model set temperature 0.1, /model"\
                  " set reasoning medium)"
+            echo "/context         show the context window; /context 128000"\
+                 "sets it in tokens,"
+            echo "                 /context compact 200000 sets the byte"\
+                 "limit (default resets)"
             echo "/compact         summarize the conversation to free up"\
                  "context"
             echo "                 (automatic above $COMPACT_AT bytes;"\
@@ -2922,15 +4193,34 @@ while true; do
                  "confirmation (now: $AUTO)"
             echo "/plan            plan only: read-only commands, no edits"
             echo "/build           leave plan mode and allow edits again"
+            echo "/plugins             loaded plugins and what they added"
             echo "/exit            quit (or Ctrl-D)"
+            if [[ -n "$PLUGIN_COMMAND_HELP" ]]; then
+              echo
+              echo "Plugin commands:"
+              while IFS=$'\x1f' read -r n1 h1 _; do
+                [[ -n "$n1" ]] && printf '/%-15s %s\n' "$n1" "$h1"
+              done <<<"$PLUGIN_COMMAND_HELP"
+            fi
             cmds=$(list_commands)
             if [[ -n "$cmds" ]]; then
               echo
               echo "Prompt commands (text after the name is passed along):"
               printf '%s\n' "$cmds"
             fi ;;
+    /plugins) plugin_info ;;
     *) # /name [text] runs a prompt command; "/usr/bin is broken" is a message
-       if [[ "$input" =~ ^/([A-Za-z][A-Za-z0-9_-]*)([[:space:]]+(.*))?$ ]]; then
+       if plugin_command_match "$input"; then
+         AGENT_PROMPT=""
+         if declare -F "cmd_$PLUGIN_CMD" >/dev/null; then
+           plugin_call "cmd_$PLUGIN_CMD" "$PLUGIN_ARGS" || true
+         else
+           printf 'agent.sh: /%s: the plugin did not define cmd_%s\n' \
+             "$PLUGIN_CMD" "$PLUGIN_CMD" >&2
+         fi
+         input="$AGENT_PROMPT"; AGENT_PROMPT=""
+       elif [[ "$input" =~ ^/([A-Za-z][A-Za-z0-9_-]*)([[:space:]]+(.*))?$ ]]
+       then
          if find_command "${BASH_REMATCH[1]}"; then
            printf '\033[2m(/%s: %s)\033[0m\n' "${BASH_REMATCH[1]}" \
              "$CMD_FILE" >&2
@@ -2942,16 +4232,20 @@ while true; do
          fi
        fi
        if [[ -n "$input" ]]; then
+         plugin_hooks turn_start "$input"
          auto_compact        # must run before the new message joins the history
          append "$(printf '%s' "$input" |
                    jq -cRs '{role: "user", content: .}')"
          run_turn
+         plugin_hooks turn_end "$TURN_OK"
        fi ;;
   esac
+  sync_settings
   input=""
   if (( ONESHOT )); then break; fi
 done
 
+plugin_hooks exit
 (( ! SUB )) && [[ -f "$(session_file)" ]] &&
   echo "Session saved. Resume with: agent.sh -c  (or -r $SESSION_ID)" >&2
 # One-shot runs are used from scripts: a failed turn is a failed run
