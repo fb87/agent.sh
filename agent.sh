@@ -226,8 +226,8 @@ COPILOT_EDITOR="${COPILOT_EDITOR:-vscode/1.99.3}"
 COPILOT_PLUGIN="${COPILOT_PLUGIN:-copilot-chat/0.26.7}"
 CONFIG_LOADED=0
 
-VERSION="0.5.0"
-RELEASED="2026-11-13"
+VERSION="0.6.0"
+RELEASED="2026-11-17"
 AUTHOR="fb87"                                       # see LICENSE
 
 new_id() {
