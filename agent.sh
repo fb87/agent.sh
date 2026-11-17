@@ -4,7 +4,7 @@
 # (jq programs are single-quoted on purpose; tools are called as "tool_$name")
 # Keep this file clean: nix develop -c shellcheck agent.sh (also run by
 # nix flake check). Never silence a finding without a comment saying why.
-# agent.sh — tiny coding agent for OpenCode Go (OpenAI-compatible API)
+# agent.sh — tiny coding agent for OpenCode Go (Responses API)
 #
 # Usage: agent.sh [-y] [-p | -b] [-i] [-c | -r SESSION_ID] [-h] [-V] [prompt...]
 #        agent.sh -l [all]
@@ -54,8 +54,10 @@
 # AGENT_API_KEY, else OPENCODE_API_KEY, OPENAI_API_KEY or OPENROUTER_API_KEY
 # for that provider, else "api_key" in the config file. The "providers"
 # object in config.json sets a model, key or endpoint for each provider and
-# can add your own: {"providers": {"work": {"url": "https://host/v1/chat/
-# completions", "api_key": "...", "model": "..."}}}. The REPL switches with
+# can add your own: {"providers": {"work": {"url": "https://host/v1/
+# responses", "api_key": "...", "model": "..."}}}. An endpoint must speak
+# the Responses API; a URL ending in /chat/completions is moved to /responses.
+# The REPL switches with
 # /provider list and /provider use NAME [MODEL]; one provider's key is never
 # sent to another. Copilot signs in with GitHub's device flow: run
 # agent.sh --login copilot (or /login copilot); the token is kept in
@@ -207,7 +209,6 @@ API_KEY=""                             # set by load_settings
 API_KEY_SOURCE=""
 PKIND="plain"                          # opencode, copilot, local or plain
 URL_FIXED=0                            # 1 = the user chose this endpoint
-RESP_MODELS="${AGENT_RESPONSES_MODELS-}"  # models that need /responses
 TODOS='[]'                             # the model's todo list (JSON)
 # GitHub Copilot: a sign-in token is exchanged for a short-lived session
 # token (API_KEY) that expires at COPILOT_EXP (epoch seconds). The client id
@@ -217,7 +218,7 @@ COPILOT_OAUTH=""
 COPILOT_EXP=0
 COPILOT_CLIENT_ID="Iv1.b507a08c87ecfe98"
 COPILOT_API_URL="${COPILOT_API_URL:-\
-https://api.githubcopilot.com/chat/completions}"
+https://api.githubcopilot.com/responses}"
 COPILOT_TOKEN_URL="${COPILOT_TOKEN_URL:-\
 https://api.github.com/copilot_internal/v2/token}"
 COPILOT_LOGIN_URL="${COPILOT_LOGIN_URL:-https://github.com}"
@@ -530,20 +531,20 @@ provider_spec() {
   case "$1" in
     opencode|opencode-go)
       P_NAME=opencode; P_KIND=opencode; P_REASONING=low
-      P_URL='https://opencode.ai/zen/go/v1/chat/completions'
+      P_URL='https://opencode.ai/zen/go/v1/responses'
       P_MODEL="deepseek-v4.1-flash" ;;
     copilot|github-copilot)
       P_NAME=copilot; P_KIND=copilot
       P_URL="$COPILOT_API_URL"; P_MODEL="gpt-4.1" ;;
     openai)
-      P_URL='https://api.openai.com/v1/chat/completions'
+      P_URL='https://api.openai.com/v1/responses'
       P_MODEL="gpt-4.1-mini" ;;
     openrouter)
-      P_URL='https://openrouter.ai/api/v1/chat/completions'
+      P_URL='https://openrouter.ai/api/v1/responses'
       P_MODEL="openai/gpt-4.1-mini" ;;
     ollama)
       P_KIND=local
-      P_URL='http://localhost:11434/v1/chat/completions'
+      P_URL='http://localhost:11434/v1/responses'
       P_MODEL="qwen2.5-coder:7b" ;;
     *) # one a plugin added: its function says what it is
        if [[ "$PLUGIN_PROVIDERS" == *" $1 "* ]] && declare -F "provider_$1" \
@@ -648,6 +649,15 @@ resolve_provider() {
   if [[ -z "$R_URL" ]]; then
     R_ERR="unknown provider \"$name\"; add it under \"providers\" in"
     R_ERR+=" $CONFIG_FILE with a \"url\" (/provider list shows the others)"
+    return 1
+  fi
+  # Everything goes through the Responses API. A URL that still has the old
+  # /chat/completions ending is accepted and moved over.
+  R_URL="${R_URL%/}"
+  if [[ "$R_URL" == */chat/completions ]]; then
+    R_URL="${R_URL%/chat/completions}/responses"
+  elif [[ "$R_URL" != */responses ]]; then
+    R_ERR="the url of provider \"$name\" must end in /responses: $R_URL"
     return 1
   fi
 
@@ -809,7 +819,7 @@ copilot_session() {
   api=$(jq -r '.endpoints.api // empty' "$TMP/cp.json" 2>/dev/null) || api=""
   if (( ! URL_FIXED )) &&
      [[ "$api" =~ ^https://([A-Za-z0-9-]+\.)*githubcopilot\.com$ ]]; then
-    URL="$api/chat/completions"
+    URL="$api/responses"
   fi
   rm -f "$TMP/cp.json" "$TMP/cp.err"
   write_auth
@@ -951,11 +961,10 @@ provider_use() {
   fi
 }
 
-# The endpoint that lists the models, derived from the chat endpoint
+# The endpoint that lists the models, derived from the response endpoint
 models_url() {
   local u="${URL%/}"
-  u="${u%/chat/completions}"
-  printf '%s/models' "$u"
+  printf '%s/models' "${u%/responses}"
 }
 
 # One top-level string/number/boolean field of a JSON config; empty if absent.
@@ -1985,17 +1994,10 @@ trap 'INTERRUPTED=1' INT
 
 session_file() { printf '%s/%s.json' "$SESSION_DIR" "$SESSION_ID"; }
 
-# Some models are served only by the /responses API. RESP_MODELS lists the
-# "provider/model" pairs known to need it (learned when /chat/completions
-# refuses one and /responses takes it; an explorer inherits the list).
-uses_responses() { [[ " $RESP_MODELS " == *" $PROVIDER/$MODEL "* ]]; }
-
 # The settings a conversation was held with, saved beside it. Never the key
 # or the URL: those come from where the session is resumed.
 settings_json() {
-  local api=chat
-  if uses_responses; then api=responses; fi
-  jq -cn --arg provider "$PROVIDER" --arg model "$MODEL" --arg api "$api" \
+  jq -cn --arg provider "$PROVIDER" --arg model "$MODEL" --arg api responses \
     --arg reasoning "$REASONING" --arg thinking "$THINKING" \
     --arg temperature "$TEMPERATURE" --arg context "$CONTEXT" \
     --arg compact_at "$(if (( COMPACT_AT_AUTO )); then echo auto
@@ -2152,14 +2154,7 @@ restore_settings() {
   elif [[ "$ca" =~ ^[1-9][0-9]*$ ]] && (( ! keep_ca )); then
     COMPACT_AT="$ca"; COMPACT_AT_AUTO=0
   fi
-  if [[ "$api" == responses ]] && ! uses_responses; then
-    RESP_MODELS="$RESP_MODELS $PROVIDER/$MODEL"
-  elif [[ "$api" == chat ]] && uses_responses; then
-    RESP_MODELS=" $RESP_MODELS "
-    RESP_MODELS=${RESP_MODELS// $PROVIDER\/$MODEL / }
-  fi
   note="model $MODEL${note}"
-  if uses_responses; then note+=", /responses"; fi
   if [[ -n "$REASONING" ]]; then note+=", reasoning $REASONING"; fi
   if [[ -n "$THINKING" ]]; then note+=", thinking $THINKING"; fi
   if [[ -n "$TEMPERATURE" ]]; then note+=", temperature $TEMPERATURE"; fi
@@ -2337,31 +2332,6 @@ http_post() {
     -d @-
 }
 
-# The /responses endpoint beside $URL, if $URL ends in /chat/completions
-responses_url() {
-  [[ "$URL" == */chat/completions ]] || return 1
-  printf '%s/responses\n' "${URL%/chat/completions}"
-}
-
-# True if the error body in $TMP/sse says the model is not served by the
-# endpoint it was sent to. $1 is the HTTP code, $2 "chat" or "responses".
-wrong_endpoint() {
-  local code="$1" which="$2" msg
-  [[ "$code" =~ ^(400|404|422)$ ]] || return 1
-  msg=$(jq -r '(.error // .) | if type == "object" then (.message // "")
-               elif type == "string" then . else "" end' "$TMP/sse" \
-        2>/dev/null) || return 1
-  if [[ "$which" == chat ]]; then
-    [[ "$msg" == *"/chat/completions"* ]] &&
-      [[ "$msg" == *"not accessible"* || "$msg" == *"not supported"* ||
-         "$msg" == *"only supported"* || "$msg" == *"not a chat model"* ]]
-  else
-    [[ "$msg" == *"/responses"* || "$msg" == *"not a chat model"* ]] &&
-      [[ "$msg" == *"not accessible"* || "$msg" == *"not supported"* ||
-         "$msg" == *"unsupported"* || "$msg" == *"not found"* ]]
-  fi
-}
-
 # The request body for the /responses API: $1 is 1 for no tools, $2 a chat
 # messages array. System messages become "instructions", the rest "input".
 responses_body() {
@@ -2458,12 +2428,10 @@ resp2chat() {
 # of flags: "quiet" keeps the reply off the screen, otherwise it is streamed as
 # it arrives; "notools" sends no tool definitions, so the reply is text.
 # Retries only when nothing arrived or the server asks to retry, never after
-# part of a reply was already shown. A model that /chat/completions refuses
-# is tried once on /responses; if that refuses it too, the error stands.
-# A /responses reply is converted to chat chunks before it lands in $TMP/sse.
+# part of a reply was already shown. The reply comes from the /responses API
+# and is converted to chat chunks before it lands in $TMP/sse.
 request() {
   local msgs="$1" flags=" ${2:-} " attempt code body notools=0
-  local pass api rurl="" first
   [[ -d "$TMP" ]] || mkdir -p "$TMP" 2>/dev/null || true
   if [[ "$PKIND" == copilot ]] && ! copilot_session; then
     # leave the reason where the reply would be, so the caller reports it
@@ -2484,79 +2452,26 @@ request() {
   fi
   ensure_tmp
   if [[ "$flags" == *" notools "* ]]; then notools=1; fi
-  api=chat
-  if uses_responses && rurl=$(responses_url); then api=responses; fi
-  first="$api"
-  for pass in 1 2; do
-    if [[ "$api" == chat ]]; then
-      body=$(jq -c --arg model "$MODEL" --argjson tools "$TOOLS" \
-        --argjson notools "$notools" --arg reasoning "$REASONING" \
-        --arg thinking "$THINKING" --arg temperature "$TEMPERATURE" \
-        '{model: $model}
-         + (if $reasoning == "" then {} else {reasoning_effort: $reasoning} end)
-         + (if $thinking == "" then {}
-            else {thinking: {type: (if $thinking == "on" then "enabled"
-                                     else "disabled" end)}} end)
-         + (if $temperature == "" then {}
-            else {temperature: ($temperature | tonumber)} end)
-         + {messages: ., stream: true}
-         + (if $notools == 1 then {} else {tools: $tools} end)' <<<"$msgs")
+  body=$(responses_body "$notools" "$msgs")
+  for attempt in 1 2 3 4; do
+    : >"$TMP/sse"; : >"$TMP/hdr"
+    if [[ "$flags" == *" quiet "* ]]; then
+      printf '%s' "$body" | http_post "$URL" | resp2chat \
+        | tee "$TMP/sse" >/dev/null || true
     else
-      body=$(responses_body "$notools" "$msgs")
+      printf '%s' "$body" | http_post "$URL" | resp2chat \
+        | tee "$TMP/sse" | show_stream || true
     fi
-    for attempt in 1 2 3 4; do
-      : >"$TMP/sse"; : >"$TMP/hdr"
-      if [[ "$api" == chat ]]; then
-        if [[ "$flags" == *" quiet "* ]]; then
-          printf '%s' "$body" | http_post "$URL" | tee "$TMP/sse" >/dev/null \
-            || true
-        else
-          printf '%s' "$body" | http_post "$URL" | tee "$TMP/sse" \
-            | show_stream || true
-        fi
-      elif [[ "$flags" == *" quiet "* ]]; then
-        printf '%s' "$body" | http_post "$rurl" | resp2chat \
-          | tee "$TMP/sse" >/dev/null || true
-      else
-        printf '%s' "$body" | http_post "$rurl" | resp2chat \
-          | tee "$TMP/sse" | show_stream || true
-      fi
-      (( INTERRUPTED )) && return 0
-      code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
-      if [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
-        break
-      fi
-      if (( attempt == 4 )); then break; fi
-      printf '(request failed%s; retrying in %ss...)\n' \
-        "${code:+, HTTP $code}" $((attempt * 2)) >&2
-      sleep $((attempt * 2)) || true
-      (( INTERRUPTED )) && return 0
-    done
-    if [[ "$api" == chat ]] && (( pass == 1 )) &&
-       wrong_endpoint "$code" chat && rurl=$(responses_url); then
-      printf '(%s is not served by /chat/completions; trying /responses)\n' \
-        "$MODEL" >&2
-      api=responses
-      continue
+    (( INTERRUPTED )) && return 0
+    code=$(awk '/^HTTP\//{c = $2} END{print c}' "$TMP/hdr")
+    if [[ -s "$TMP/sse" && ! "$code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
+      break
     fi
-    # remember a model that /responses took, so later prompts go straight there
-    if [[ "$api" == responses && "$code" =~ ^2[0-9][0-9]$ ]] &&
-       ! uses_responses; then
-      RESP_MODELS="$RESP_MODELS $PROVIDER/$MODEL"
-    elif [[ "$api" == responses ]] && wrong_endpoint "$code" responses; then
-      # /responses does not take it: forget what was learned or restored
-      RESP_MODELS=" $RESP_MODELS "
-      RESP_MODELS=${RESP_MODELS// $PROVIDER\/$MODEL / }
-      if [[ "$first" == responses ]] && (( pass == 1 )); then
-        # it was only remembered as a /responses model: chat was not tried
-        printf '(%s is not served by /responses; trying /chat/completions)\n' \
-          "$MODEL" >&2
-        api=chat
-        continue
-      fi
-      # neither endpoint takes it: the error is shown as it is
-    fi
-    return 0
+    if (( attempt == 4 )); then break; fi
+    printf '(request failed%s; retrying in %ss...)\n' \
+      "${code:+, HTTP $code}" $((attempt * 2)) >&2
+    sleep $((attempt * 2)) || true
+    (( INTERRUPTED )) && return 0
   done
   return 0
 }
@@ -3871,7 +3786,6 @@ sub_start() {
     umask "$ORIG_UMASK"
     # The key and the settings of this run go by environment, not argv
     export AGENT_SUB=1 AGENT_SUB_NAME="explorer $n" AGENT_API_KEY="$API_KEY"
-    export AGENT_RESPONSES_MODELS="$RESP_MODELS"
     export MODEL PROVIDER URL REASONING THINKING TEMPERATURE MAX_OUT TIMEOUT
     export CMD_TIMEOUT SUB_MAX_STEPS PROJECT_DOC AUTO_COMPACT COMPACT_AT
     export OUTSIDE WORKSPACE ALLOW_PATHS ASK_CMDS READ_LINES

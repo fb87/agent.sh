@@ -1,7 +1,7 @@
 # agent.sh
 
 A coding agent in a single bash file. One script, `jq` and `curl`; it talks to
-OpenAI-compatible chat-completions endpoints — OpenCode Go by default, with
+endpoints that speak the OpenAI Responses API — OpenCode Go by default, with
 GitHub Copilot, OpenAI, OpenRouter and Ollama built in — and can inspect, edit
 and run things in the current directory. Shell plugins can add commands, tools,
 providers and hooks.
@@ -88,7 +88,7 @@ An example user config:
   "temperature": 0.2,
   "providers": {
     "work": {
-      "url": "https://llm.example.com/v1/chat/completions",
+      "url": "https://llm.example.com/v1/responses",
       "model": "gpt-4.1-mini",
       "api_key": "sk-work-..."
     },
@@ -101,7 +101,7 @@ An example user config:
 | --- | --- | --- |
 | `provider` | `opencode` | provider to use (see [Providers](#providers)) |
 | `model` | the provider's default | model name |
-| `url` | the provider's endpoint | full chat-completions URL |
+| `url` | the provider's endpoint | Responses API URL, ends in `/responses` |
 | `api_key` | unset | API key; keep the file at mode `0600` |
 | `reasoning` | the provider's default | `minimal`, `low`, `medium`, `high` or `default` |
 | `thinking` | server default | `on`, `off` or `default` |
@@ -129,7 +129,6 @@ variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
 | `PROVIDER` | `opencode` | provider to use (see [Providers](#providers)) |
 | `AGENT_PLUGINS` | unset | plugin files and directories, colon-separated; `none` loads none (see [Plugins](#plugins)) |
 | `CLI_HINTS` | `1` | `0` stops telling the model about `rg`, `fd`, `fzf`, `ast-grep` and `tree` |
-| `AGENT_RESPONSES_MODELS` | unset | `provider/model` pairs that need `/responses`, space-separated |
 | `MAX_OUT` | `20000` | tool output bytes sent to the model |
 | `READ_LINES` | `400` | lines the `read` tool returns at most |
 | `WEB` | `1` | `0` removes `web_search` and `web_fetch` |
@@ -169,11 +168,11 @@ in:
 
 | Provider | Endpoint | Default model | Notes |
 | --- | --- | --- | --- |
-| `opencode` (`opencode-go`) | `https://opencode.ai/zen/go/v1/chat/completions` | `deepseek-v4.1-flash` | default; reasoning `low` |
+| `opencode` (`opencode-go`) | `https://opencode.ai/zen/go/v1/responses` | `deepseek-v4.1-flash` | default; reasoning `low` |
 | `copilot` (`github-copilot`) | GitHub Copilot API | `gpt-4.1` | sign in with GitHub, see below |
-| `openai` | `https://api.openai.com/v1/chat/completions` | `gpt-4.1-mini` | |
-| `openrouter` | `https://openrouter.ai/api/v1/chat/completions` | `openai/gpt-4.1-mini` | |
-| `ollama` | `http://localhost:11434/v1/chat/completions` | `qwen2.5-coder:7b` | local, needs no key |
+| `openai` | `https://api.openai.com/v1/responses` | `gpt-4.1-mini` | |
+| `openrouter` | `https://openrouter.ai/api/v1/responses` | `openai/gpt-4.1-mini` | |
+| `ollama` | `http://localhost:11434/v1/responses` | `qwen2.5-coder:7b` | local, needs no key |
 
 The models are only starting points; `/model list` shows what the endpoint
 really offers, and `model` and `reasoning` in the config file or the
@@ -193,7 +192,7 @@ file; that also overrides the endpoint, model or key of a built-in one:
 {
   "providers": {
     "work": {
-      "url": "https://llm.example.com/v1/chat/completions",
+      "url": "https://llm.example.com/v1/responses",
       "model": "gpt-4.1-mini",
       "api_key": "sk-work-...",
       "reasoning": "medium"
@@ -209,11 +208,11 @@ use, with `*` on the current one and whether it is ready. `/provider use NAME
 not (ids differ between providers). It warns when the new endpoint is not
 `https`.
 
-Some endpoints serve a model only at `/responses` (the Responses API) and not
-at `/chat/completions`. agent.sh tries both, remembers which one the model
-needed and goes straight there next time; `/about` shows it. The list is kept
-in `AGENT_RESPONSES_MODELS` as space-separated `provider/model` pairs and is
-passed on to explorers.
+Every request goes to the Responses API. An endpoint that is not one cannot
+be used: `url` has to end in `/responses` (a URL ending in `/chat/completions`
+is moved over to `/responses`), and a model an endpoint serves only at
+`/chat/completions` is out of reach — pick a model it also serves at
+`/responses`, or point `url` at a gateway that translates.
 
 ### GitHub Copilot
 

@@ -14,6 +14,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list is shown as it changes, saved with the session and carried through
   compaction; `/todo` (or `/todo clear`) shows or clears it.
 
+### Changed
+
+- Every request goes to the Responses API; it is now the only endpoint
+  agent.sh speaks. The built-in providers point at `/responses`, `url` has
+  to end in `/responses` (a URL ending in `/chat/completions` is moved
+  over), and the session file records `api: responses`.
+
+### Removed
+
+- **Breaking:** the `/chat/completions` endpoint. Endpoints that only serve
+  it, and models an endpoint offers only there, can no longer be used; point
+  `url` at a gateway that translates, or pick a model the endpoint also
+  serves at `/responses`. The per-request fallback and the list of models
+  that needed `/responses` are gone with it, so `AGENT_RESPONSES_MODELS` is
+  now ignored.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added
