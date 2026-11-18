@@ -21,7 +21,7 @@
 #   prompt   optional first message; the agent answers it and exits (one-shot)
 #            unless -i is given (put -- before a prompt that starts with '-')
 #
-# REPL commands: /help  /about  /model  /compact  /sessions [all]  /btw
+# REPL commands: /help  /about  /model  /compact  /sessions [all]
 #                /resume ID  /reset  /auto  /plan  /build  /exit (Ctrl-D)
 # /model shows the model, reasoning effort, thinking and temperature;
 # /model set temperature 0.1 (or reasoning medium, thinking off) changes one
@@ -42,7 +42,7 @@
 # Plugins: *.sh files in $XDG_CONFIG_HOME/agent.sh/plugins (and AGENT_PLUGINS)
 # are sourced at startup and add commands, tools, providers and hooks;
 # /plugins lists them, AGENT_PLUGINS=none loads none (README, "Plugins").
-# /btw QUESTION asks on the side: the answer is not kept in the history.
+# /tmp on forks a temporary, unsaved session; /tmp off goes back.
 # The todo tool lets the model keep a plan for a longer task; it is shown as
 # it changes, kept with the session and through compaction (/todo shows it).
 # rg, fd (fdfind), fzf, ast-grep and tree, when installed, are suggested to
@@ -211,6 +211,7 @@ API_KEY_SOURCE=""
 PKIND="plain"                          # opencode, copilot, local or plain
 URL_FIXED=0                            # 1 = the user chose this endpoint
 TODOS='[]'                             # the model's todo list (JSON)
+TMP_ON=0; TMP_KEEP_MSGS=""; TMP_KEEP_TODOS=""   # /tmp: a temporary session
 # GitHub Copilot: a sign-in token is exchanged for a short-lived session
 # token (API_KEY) that expires at COPILOT_EXP (epoch seconds). The client id
 # is the public one of the Copilot plugin for Vim/Neovim. The URLs can be
@@ -287,7 +288,7 @@ PLUGIN_ERR=""
 AGENT_PROMPT=""
 PLUGIN_BUILTIN_COMMANDS=" help about model provider login compact context"
 PLUGIN_BUILTIN_COMMANDS+=" sessions resume reset auto plan build exit quit"
-PLUGIN_BUILTIN_COMMANDS+=" plugins todo btw "
+PLUGIN_BUILTIN_COMMANDS+=" plugins todo tmp "
 PLUGIN_BUILTIN_TOOLS=" bash read write edit web_search web_fetch explore todo "
 PLUGIN_BUILTIN_PROVIDERS=" opencode opencode-go copilot github-copilot openai"
 PLUGIN_BUILTIN_PROVIDERS+=" openrouter ollama "
@@ -1238,8 +1239,16 @@ prompt_notes() {
 }
 
 # Prints the 20 most recent saved sessions ($1 = "all" for every directory)
+# $1 with the home directory shown as ~, never shortened
+tilde_path() {
+  local home=${HOME%/}
+  if [[ -n "$home" && ( "$1" == "$home" || "$1" == "$home"/* ) ]]; then
+    printf '~%s' "${1#"$home"}"
+  else printf '%s' "$1"; fi
+}
+
 list_sessions() {
-  local f n=0 cur id count preview cwd when
+  local f n=0 cur id count preview cwd when tag
   while IFS= read -r f; do
     IFS=$'\t' read -r cur id count preview cwd < <(
       jq -r --arg pwd "$PWD" --arg all "${1:-}" --arg cur "${SESSION_ID:-}" '
@@ -1252,14 +1261,31 @@ list_sessions() {
     # (no empty fields: read would shift them)
     when=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null ||
            stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")
-    printf '%s %s  %-36s %3s msgs  %s' "$cur" "$when" "$id" "$count" "$preview"
-    if [[ "${1:-}" == all ]]; then printf '  \033[2m%s\033[0m' "$cwd"; fi
-    printf '\n'
+    if (( n == 0 )); then
+      # say whose sessions these are: the list depends on the directory
+      if [[ "${1:-}" == all ]]; then echo "Saved sessions, all workspaces:"
+      else
+        printf 'Saved sessions in \033[34m%s\033[0m:\n' "$(tilde_path "$PWD")"
+      fi
+    fi
+    tag=""
+    if [[ "$f" == "$SESSION_DIR/backup/"* ]]; then
+      tag=$'  \033[33mbackup\033[0m'
+    fi
+    printf '%s %s  %-36s %3s msgs%s' "$cur" "$when" "$id" "$count" "$tag"
+    if [[ "${1:-}" == all ]]; then
+      printf '  \033[34m%s\033[0m' "$(tilde_path "$cwd")"
+    fi
+    printf '  %s\n' "$preview"
     (( ++n >= 20 )) && break
-  done < <(ls -t "$SESSION_DIR"/*.json 2>/dev/null)
+  done < <(ls -t "$SESSION_DIR"/*.json "$SESSION_DIR"/backup/*.json \
+             2>/dev/null)
   if (( n == 0 )); then
     if [[ "${1:-}" == all ]]; then echo "No saved sessions."
-    else echo "No saved sessions for $PWD (try: all)."; fi
+    else
+      echo "No saved sessions in $(tilde_path "$PWD") (/sessions all lists" \
+        "every workspace)."
+    fi
   fi
   return 0
 }
@@ -1534,6 +1560,7 @@ about() {
 }
 
 RESUME=""
+NEW_SESSION=0
 LIST=0
 INTERACTIVE=0
 LOGIN=""
@@ -1546,6 +1573,7 @@ while (( $# )); do
     --version) printf 'agent.sh %s\n' "$VERSION"; exit 0 ;;
     --plan)    ARGS+=(-p); shift ;;       # in order, so the last one wins
     --build)   ARGS+=(-b); shift ;;
+    --new)     NEW_SESSION=1; shift ;;
     --login)   LOGIN=copilot; shift          # the only login there is
                case "${1:-}" in
                  copilot|github-copilot) shift ;;
@@ -2010,6 +2038,8 @@ settings_json() {
 
 save_session() {
   local f settings; f=$(session_file)
+  (( ${TMP_ON:-0} )) && return 0       # a temporary session is never saved
+  (( ${NOSAVE:-0} )) && return 0       # nor a run that may not replace one
   settings=$(settings_json)
   LAST_SETTINGS="$settings"
   [[ -d "$SESSION_DIR" ]] || mkdir -p "$SESSION_DIR" 2>/dev/null || true
@@ -2073,11 +2103,12 @@ resolve_session() {
   local f n=0 hit=""
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] ||
     { echo "Invalid session id '$1'." >&2; return 1; }
-  if [[ -f "$SESSION_DIR/$1.json" ]]; then printf '%s\n' "$1"; return 0; fi
+  if [[ -f "$SESSION_DIR/$1.json" || -f "$SESSION_DIR/backup/$1.json" ]]
+  then printf '%s\n' "$1"; return 0; fi
   # No nullglob and no ${#array[@]}: an unmatched pattern stays literal and is
   # skipped by the -e test, and the counter also works on bash < 4.4 (where an
   # empty array trips "set -u")
-  for f in "$SESSION_DIR/$1"*.json; do
+  for f in "$SESSION_DIR/$1"*.json "$SESSION_DIR/backup/$1"*.json; do
     [[ -e "$f" ]] || continue
     n=$((n + 1)); hit="$f"
   done
@@ -2101,7 +2132,7 @@ sync_settings() {
 restore_settings() {
   local from="$1" s p m api r t th cx ca keep_p=0 keep_m=0 keep_r=0 keep_t=0
   local keep_th=0 keep_cx=0 keep_ca=0 note="" X=$'\x1f'
-  local f="$SESSION_DIR/$SESSION_ID.json"
+  local f; f=$(session_path "$SESSION_ID")
   s=$(jq -c '.settings // empty | if type == "object" then . else empty end' \
         "$f" 2>/dev/null) || s=""
   [[ -n "$s" ]] || return 0
@@ -2167,6 +2198,137 @@ restore_settings() {
 
 # Switches to a saved session; the current one is already saved.
 # $2 is "start" when this is the -c/-r of the command line.
+# ------------------------------------------------- one session per workspace
+
+# A workspace (the directory agent.sh runs in) has one saved session. A fresh
+# start where one exists asks at the first prompt whether to resume it or
+# start over; starting over keeps the old one as the workspace's backup (one
+# backup: the next start-over replaces it). A run that cannot ask (a prompt
+# on the command line, or no terminal) leaves the saved session alone and
+# saves nothing. -c resumes, --new starts over without asking.
+BACKUP_DIR="$SESSION_DIR/backup"
+NOSAVE=0                 # 1: this run saves nothing (the workspace has one)
+ASK_SESSION=0            # 1: ask resume / new at the first prompt
+WS_SESSION=""            # the workspace's saved session, while asking
+
+# The cwd a session file was saved in
+session_cwd() { jq -r '.cwd // empty' "$1" 2>/dev/null; }
+
+# Moves this workspace's saved sessions to the backup slot, replacing the
+# backup it had. Normally that is one session; sessions saved by older
+# versions (several per workspace) all go, and the next start-over drops them.
+backup_workspace() {
+  local f moved=""
+  mkdir -p "$BACKUP_DIR" 2>/dev/null && chmod 700 "$BACKUP_DIR" 2>/dev/null
+  for f in "$BACKUP_DIR"/*.json; do
+    [[ -e "$f" ]] || continue
+    if [[ "$(session_cwd "$f")" == "$PWD" ]]; then rm -f "$f"; fi
+  done
+  for f in "$SESSION_DIR"/*.json; do
+    [[ -e "$f" ]] || continue
+    [[ "$(session_cwd "$f")" == "$PWD" ]] || continue
+    if mv -f "$f" "$BACKUP_DIR/" 2>/dev/null; then
+      moved+="${moved:+, }$(basename "$f" .json | cut -c1-8)"
+    fi
+  done
+  if [[ -n "$moved" ]]; then
+    printf '(the previous session %s is kept as a backup: /resume %s)\n' \
+      "$moved" "${moved%%,*}" >&2
+  fi
+}
+
+# Asked at the first prompt of a fresh start in a workspace that has a
+# session. Fails if the prompt should not be sent (the user cancelled).
+session_choice() {
+  local ans="" n first
+  ASK_SESSION=0
+  n=$(jq '[.messages[] | select(.role == "user")] | length' \
+        "$SESSION_DIR/$WS_SESSION.json" 2>/dev/null) || n="?"
+  first=$(jq -r '[.messages[] | select(.role == "user") | .content
+                  | strings] | last // "" | gsub("\\s+"; " ") | .[:50]' \
+            "$SESSION_DIR/$WS_SESSION.json" 2>/dev/null | strip_controls) ||
+    first=""
+  printf 'This workspace has a saved session %s (%s user messages,' \
+    "${WS_SESSION:0:8}" "$n" >&2
+  printf ' last: %s).\n' "${first:--}" >&2
+  if ! { true </dev/tty; } 2>/dev/null; then
+    NOSAVE=1
+    echo "(no terminal to ask on: this run is not saved; -c resumes it)" >&2
+    return 0
+  fi
+  read -rp "[r]esume it, start [n]ew (it is kept as a backup), or [c]ancel? " \
+    ans </dev/tty || ans=""
+  case "$ans" in
+    [Rr]|[Rr]esume)
+      load_session "$WS_SESSION" || return 1
+      apply_mode "$MODE" ;;
+    [Nn]|[Nn]ew) backup_workspace ;;
+    *) echo "Cancelled; your prompt was not sent (Up brings it back)."
+       ASK_SESSION=1
+       return 1 ;;
+  esac
+  WS_SESSION=""
+}
+
+# /resume ID, or -r ID: this workspace's session or its backup becomes the
+# session (a backup swaps places with the current one); another workspace's
+# session opens as a temporary session, since this workspace keeps its own.
+open_session() {
+  local id f cwd
+  id=$(resolve_session "$1") || return 1
+  f=$(session_path "$id")
+  cwd=$(session_cwd "$f")
+  if [[ "$cwd" == "$PWD" || -z "$cwd" ]]; then
+    if [[ "$f" == "$BACKUP_DIR/"* ]]; then
+      # the backup comes back; what is saved now becomes the backup
+      [[ -f "$(session_file)" ]] && save_session
+      mv -f "$f" "$SESSION_DIR/$id.json.$$.restore" 2>/dev/null || return 1
+      backup_workspace
+      mv -f "$SESSION_DIR/$id.json.$$.restore" "$SESSION_DIR/$id.json"
+    fi
+    ASK_SESSION=0; WS_SESSION=""; NOSAVE=0
+    load_session "$id" "${2:-}" || return 1
+    apply_mode "$MODE"
+    return 0
+  fi
+  if (( TMP_ON )); then echo "In a temporary session: /tmp off first."
+    return 1
+  fi
+  TMP_KEEP_MSGS="$MESSAGES"; TMP_KEEP_TODOS="$TODOS"; TMP_ON=1
+  MESSAGES=$(jq -c --arg s "$SYSTEM" '
+      (.messages | if type == "array" then . else [] end) | '"$REPAIR"'
+      | if (.[0].role // "") == "system" then .[0].content = $s
+        else [{role: "system", content: $s}] + . end' "$f" 2>/dev/null) ||
+    MESSAGES="$TMP_KEEP_MSGS"
+  printf 'Opened session %s of %s as a temporary session (not saved;' \
+    "${id:0:8}" "$(tilde_path "$cwd")"
+  printf ' /tmp off comes back).\n'
+}
+
+# A fresh history in a workspace that already has a session: --new starts
+# over, a run that cannot ask saves nothing, otherwise the first prompt asks
+workspace_check() {
+  WS_SESSION=""
+  (( SUB )) && return 0
+  WS_SESSION=$(find_last_session) || { WS_SESSION=""; return 0; }
+  if (( NEW_SESSION )); then
+    backup_workspace                     # --new: start over, no question
+    WS_SESSION=""
+  elif (( ONESHOT )); then
+    NOSAVE=1; WS_SESSION=""
+    printf '(this workspace has a saved session: this run is not saved;' >&2
+    printf ' -c continues it, --new replaces it)\n' >&2
+  else
+    ASK_SESSION=1
+  fi
+}
+
+# Where session $1 is: the sessions directory, or the backups
+session_path() {
+  if [[ -f "$SESSION_DIR/$1.json" ]]; then printf '%s' "$SESSION_DIR/$1.json"
+  else printf '%s' "$BACKUP_DIR/$1.json"; fi
+}
+
 load_session() {
   local id msgs n
   id=$(resolve_session "$1") || return 1
@@ -2177,7 +2339,7 @@ load_session() {
       (.messages | if type == "array" then . else empty end) | '"$REPAIR"'
       | if (.[0].role // "") == "system" then .
         else [{role: "system", content: $s}] + . end' \
-    "$SESSION_DIR/$id.json" 2>/dev/null) || msgs=""
+    "$(session_path "$id")" 2>/dev/null) || msgs=""
   if [[ -z "$msgs" ]]; then
     echo "Could not read session $id: no usable \"messages\" array." >&2
     return 1
@@ -2190,7 +2352,7 @@ load_session() {
        | {text: (.text | gsub("[\u0000-\u001f\u007f-\u009f]+"; " ")
                 | .[:300]), status: (.status
           | if IN("pending", "in_progress", "done") then . else "pending"
-            end)}] else [] end' "$SESSION_DIR/$id.json" 2>/dev/null) ||
+            end)}] else [] end' "$(session_path "$id")" 2>/dev/null) ||
     TODOS='[]'
   [[ -n "$TODOS" ]] || TODOS='[]'
   n=$(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES")
@@ -2210,7 +2372,15 @@ if [[ -n "$RESUME" ]]; then
     RESUME=$(find_last_session) ||
       { echo "agent.sh: no saved session for $PWD" >&2; exit 1; }
   fi
-  load_session "$RESUME" start || exit 1
+  if [[ "$RESUME" == "$(find_last_session 2>/dev/null)" ]]; then
+    load_session "$RESUME" start || exit 1
+  else
+    # a backup, or another workspace's session (opened as a temporary one)
+    SESSION_ID=$(new_id); new_history
+    open_session "$RESUME" start || exit 1
+    # another workspace's session is a fork: this one's own rules still hold
+    if (( TMP_ON )); then workspace_check; fi
+  fi
 else
   SESSION_ID="${SESSION_ID:-$(new_id)}"
   # It becomes a file name and a request header
@@ -2219,6 +2389,7 @@ else
       exit 2; }
   new_history
   (( SUB )) || about                     # banner on a fresh start
+  workspace_check
 fi
 apply_mode "$MODE"
 
@@ -3751,40 +3922,40 @@ tool_todo() {
   if (( n == 0 )); then TOOL_OUT="Todo list cleared."; fi
 }
 
-# /btw QUESTION: a side question about the work, answered from the
-# conversation so far but kept out of it: nothing is added to the history
-# or the session, and no tools are offered. /btw! asks without the history.
-BTW_NOTE='(A side question from the user. Answer it briefly from what you '
-BTW_NOTE+='already know; you have no tools for it. It is not kept in the '
-BTW_NOTE+='conversation, so do not change the plan or the task because of it.)'
-btw() {
-  local bare="$1" q="$2" msgs result msg
-  q=${q#"${q%%[![:space:]]*}"}
-  if [[ -z "${q//[[:space:]]/}" ]]; then
-    echo "Usage: /btw <question>  (/btw! <question> leaves the history out)"
-    return 0
-  fi
-  INTERRUPTED=0
-  if (( bare )); then
-    msgs=$(jq -cn --arg s "$SYSTEM" --arg q "$q" \
-      '[{role: "system", content: $s}, {role: "user", content: $q}]')
-  else
-    msgs=$(printf '%s' "$MESSAGES" | jq -c --arg q "$BTW_NOTE"$'\n\n'"$q" \
-      "$REPAIR"' + [{role: "user", content: $q}]') || return 0
-  fi
-  printf '\033[2m(btw: not kept in the conversation)\033[0m\n' >&2
-  request "$msgs" notools
-  if (( INTERRUPTED )); then INTERRUPTED=0; echo; return 0; fi
-  result=$(assemble)
-  if ! msg=$(jq -ce '.message // empty' <<<"$result"); then
-    printf 'API error: %s\n' "$(jq -r '(.error // "(no response)")
-      | if type == "object" then (.message // tojson) else . end' \
-      <<<"$result")" >&2
-    return 0
-  fi
-  if [[ "$(jq -r '.streamed' <<<"$result")" != true ]]; then
-    jq -r '.content // empty' <<<"$msg"
-  fi
+# /tmp on forks the conversation into a temporary session that is never
+# saved: talk, run tools, compact, as long as you like; /tmp off
+# drops it and puts the main conversation and todo list back as they were.
+# Settings changed meanwhile (/model, /provider, /plan ...) are kept.
+tmp_session() {
+  local n
+  case "$1" in
+    on)
+      if (( TMP_ON )); then
+        echo "Already in a temporary session; /tmp off goes back."
+        return 0
+      fi
+      TMP_KEEP_MSGS="$MESSAGES"; TMP_KEEP_TODOS="$TODOS"; TMP_ON=1
+      n=$(jq '[.[] | select(.role == "user")] | length' <<<"$MESSAGES")
+      printf 'Temporary session: a fork of %s (%s user messages). Nothing' \
+        "${SESSION_ID:0:8}" "$n"
+      printf ' is saved; /tmp off goes back.\n' ;;
+    off)
+      if (( ! TMP_ON )); then echo "Not in a temporary session."; return 0; fi
+      n=$(jq --argjson k "$(jq length <<<"$TMP_KEEP_MSGS")" \
+            'length - $k | if . < 0 then 0 else . end' <<<"$MESSAGES")
+      MESSAGES="$TMP_KEEP_MSGS"; TODOS="$TMP_KEEP_TODOS"; TMP_ON=0
+      TMP_KEEP_MSGS=""; TMP_KEEP_TODOS=""
+      printf 'Back to session %s; the temporary one (%s new messages) was' \
+        "${SESSION_ID:0:8}" "$n"
+      printf ' dropped.\n' ;;
+    "")
+      if (( TMP_ON )); then
+        echo "In a temporary session (not saved); /tmp off goes back."
+      else
+        echo "In the main session. /tmp on forks a temporary one."
+      fi ;;
+    *) echo "Usage: /tmp [on|off]" ;;
+  esac
 }
 
 # ---------------------------------------------------------------- explorers
@@ -4104,6 +4275,8 @@ build_prompt_text() {
   b=$(context_badge)
   if [[ -n "$b" ]]; then s+=" $dim$b$r"; fi
   if (( AUTO )); then s+=" ${yel}auto$r"; fi
+  # a temporary session is highlighted: black on yellow
+  if (( TMP_ON )); then s+=" "$'\001\033[30;43m\002'" tmp $r"; fi
   s+=" $cyn${SESSION_ID:0:8}$r\$"
   printf '\n%s ' "$s"
 }
@@ -4142,18 +4315,24 @@ while true; do
     printf '%s\n' "$input" >>"$AGENT_HISTFILE" 2>/dev/null || true
   fi
 
+  # switching session from a temporary one would lose track of the main one
+  if (( TMP_ON )) && [[ "$input" == /reset || "$input" == /resume ||
+                        "$input" == "/resume "* ]]; then
+    echo "In a temporary session: /tmp off first."
+    input=""; continue
+  fi
   case "$input" in
     /exit|/quit) break ;;
     /sessions)       list_sessions;     echo "Resume one with: /resume <id>" ;;
     "/sessions all") list_sessions all; echo "Resume one with: /resume <id>" ;;
+    /tmp|"/tmp "*) read -r arg _ <<<"${input#/tmp}" || true
+            tmp_session "${arg:-}" ;;
     /resume|"/resume "*)
             read -r arg _ <<<"${input#/resume}" || true
             if [[ -z "$arg" ]]; then
               list_sessions; echo "Usage: /resume <id or unique prefix>"
             else
-              # The saved system message may be from the other mode or
-              # another directory: bring it in step, as startup does
-              if load_session "$arg"; then apply_mode "$MODE"; fi
+              open_session "$arg" || true
             fi ;;
     /about) about ;;
     /provider|"/provider info") provider_info ;;
@@ -4192,9 +4371,22 @@ while true; do
     "/model "*) echo "Usage: /model [info|list] | /model use <number or"\
                       "name> | /model set <key> <value>" ;;
     /compact) compact || true ;;
-    /btw|"/btw "*) btw 0 "${input#/btw}" ;;
-    "/btw!"|"/btw! "*) btw 1 "${input#/btw!}" ;;
-    /reset) SESSION_ID=$(new_id); new_history
+    /reset) if [[ -f "$(session_file)" ]] || find_last_session >/dev/null
+            then
+              ans=""
+              if { true </dev/tty; } 2>/dev/null; then
+                read -rp "Replace this workspace's session with a new one? The"\
+" current one is kept as a backup. [y/N] " ans </dev/tty || ans=""
+              fi
+              case "$ans" in
+                [Yy]|[Yy][Ee][Ss])
+                  [[ -f "$(session_file)" ]] && save_session
+                  NOSAVE=0; backup_workspace ;;
+                *) echo "Kept the current session."; input=""; continue ;;
+              esac
+            fi
+            ASK_SESSION=0; WS_SESSION=""; NOSAVE=0
+            SESSION_ID=$(new_id); new_history
             echo "New session $SESSION_ID." ;;
     /auto)  if [[ "$AUTO" == 1 ]]; then
               AUTO=0; echo "Commands need confirmation."
@@ -4230,8 +4422,8 @@ while true; do
                  "sets it in tokens,"
             echo "                 /context compact 200000 sets the byte"\
                  "limit (default resets)"
-            echo "/btw QUESTION    a side question, not kept in the"\
-                 "conversation (/btw! without it)"
+            echo "/tmp on|off      fork a temporary session that is not"\
+                 "saved; off goes back"
             echo "/compact         summarize the conversation to free up"\
                  "context"
             echo "                 (automatic above $COMPACT_AT bytes;"\
@@ -4288,6 +4480,10 @@ while true; do
            input=""
          fi
        fi
+       if [[ -n "$input" ]] && (( ASK_SESSION && ! TMP_ON )) &&
+          ! session_choice; then
+         input=""
+       fi
        if [[ -n "$input" ]]; then
          plugin_hooks turn_start "$input"
          auto_compact        # must run before the new message joins the history
@@ -4303,6 +4499,7 @@ while true; do
 done
 
 plugin_hooks exit
+if (( TMP_ON )); then echo "(the temporary session was dropped)" >&2; fi
 (( ! SUB )) && [[ -f "$(session_file)" ]] &&
   echo "Session saved. Resume with: agent.sh -c  (or -r $SESSION_ID)" >&2
 # One-shot runs are used from scripts: a failed turn is a failed run
