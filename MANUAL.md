@@ -597,6 +597,26 @@ Switch with `-p`/`--plan`, `-b`/`--build` (the last one on the command line
 wins), `MODE=plan`, or `/plan` / `/build` in the REPL. A sub-agent is always in
 plan mode.
 
+The switch keeps the conversation: only the system prompt is replaced in the
+first message, so everything read while planning stays in the history. In the
+REPL both commands also take a prompt, `/plan <text>` and `/build <text>`: the
+mode is switched and `<text>` is sent in the same step, so one line both leaves
+plan mode and starts the work. Without a text, a switch that changes nothing
+just says "Already in plan mode." / "Already in build mode.". Going from plan
+to build this way — or with a bare `/build` followed by your next message —
+prefixes that prompt with:
+
+```
+(Switched from plan mode to build mode: carry out the plan above. What you read
+while planning is still in this conversation; read a file again only to get the
+exact text for an edit, or if it may have changed since.)
+```
+
+so the model starts editing instead of re-reading the project. The note is
+only added when there is a conversation to carry out (not in a brand-new
+session), it is prepended to the *next* user message, and it is not added when
+switching to plan mode.
+
 ### What plan mode allows
 
 A command is split into simple commands at `;`, `|`, `&`, `(`, `)`, backticks
@@ -894,7 +914,10 @@ non-interactive bash per command, no persistent `cd`, no stdin, background
 output to a file, the `explore` tool, and that processes must be stopped by PID
 and never with `pkill bash`, `killall` or `kill -1`; it asks for concise
 answers. The plan prompt adds "plan only, read-only commands, finish with a
-step-by-step plan". The explorer prompt is the plan prompt plus the reporting
+step-by-step plan", and asks the model to read the files it plans to change
+itself (explorers report back but leave the files out of the conversation) and
+to name the functions and lines, so the plan can be carried out without looking
+at the code again. The explorer prompt is the plan prompt plus the reporting
 instructions. The compaction prompt asks for a summary that preserves what
 matters to continue the work.
 
@@ -1077,7 +1100,7 @@ are refused with "In a temporary session: /tmp off first."
 | `/resume`, `/resume <id\|prefix>` | list, or switch to a session |
 | `/reset` | start a new session; if this workspace has a saved one, it asks first and keeps it as a backup |
 | `/auto` | toggle running commands without confirmation |
-| `/plan`, `/build` | switch mode |
+| `/plan [text]`, `/build [text]` | switch mode, sending `text` as the next prompt (`/build` also tells the model to carry out the plan) |
 | `/todo`, `/todo clear` | show or clear the todo list |
 | `/plugins` | loaded plugins and what they added |
 | `/exit`, `/quit` | quit (Ctrl-D too) |

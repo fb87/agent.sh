@@ -19,6 +19,10 @@ There are two modes: build (the default) edits files and runs commands; plan
 only inspects. In build mode the model can also start read-only `explore`
 sub-agents to search the project in parallel, and it has `read`, `edit` and
 `write` tools for files plus `web_search` and `web_fetch` for the web.
+Switching modes keeps the conversation, so what was read while planning is
+still there when the edits start; `/build <text>` switches and sends the text
+as the next prompt, and from plan to build the model is told to carry out the
+plan instead of reading everything again.
 
 ## Install
 
@@ -391,7 +395,7 @@ cmd_stamp() {
 | `/resume ID` | switch to a session by id or unique prefix |
 | `/reset` | start a new session (asks first; the old one stays as a backup) |
 | `/auto` | toggle command confirmation |
-| `/plan` / `/build` | switch between read-only and editing modes |
+| `/plan [text]` / `/build [text]` | switch between read-only and editing modes; `text` is sent as the next prompt |
 | `/exit` | quit (or Ctrl-D) |
 
 Flags: `-y` (run commands without asking, except the ones below), `-p`/`--plan`

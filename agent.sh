@@ -32,6 +32,9 @@
 # the compaction threshold itself); a session keeps both.
 # There are two modes. Build (the default) edits files and runs commands.
 # Plan only inspects: it runs read-only commands and refuses everything else.
+# Switching keeps the conversation (/plan TEXT and /build TEXT switch and send
+# TEXT); going to build, the next prompt says to carry out the plan instead of
+# reading everything again.
 # A long history is summarized by itself once it reaches COMPACT_AT bytes
 # (AUTO_COMPACT=0 turns that off), also in the middle of a long turn;
 # /compact does it on demand. The latest exchange is kept as it is when it
@@ -1774,8 +1777,10 @@ PLAN_DEFAULT+='git status/diff/log/show, ...); other commands are refused '
 PLAN_DEFAULT+='by the harness. Do not edit, create or delete files, commit '
 PLAN_DEFAULT+='or run builds and tests that touch the tree. Finish with a '
 PLAN_DEFAULT+='concrete, step-by-step plan: the files to change, the exact '
-PLAN_DEFAULT+='edits, and how to verify them. Say what you would do, not '
-PLAN_DEFAULT+='what you did.'
+PLAN_DEFAULT+='edits, and how to verify them. Read the files you plan to '
+PLAN_DEFAULT+='change yourself (explorers only report back) and name the '
+PLAN_DEFAULT+='functions and lines, so the plan can be carried out without '
+PLAN_DEFAULT+='looking again. Say what you would do, not what you did.'
 BASE_SYSTEM=$(read_prompt SYSTEM.md "$SYSTEM_DEFAULT")
 # Project instructions: ./AGENTS.md joins the system prompt (PROJECT_DOC=0
 # turns that off). Capped, so a huge file cannot eat the context.
@@ -2057,6 +2062,15 @@ new_history() {
   TODOS='[]'
   MESSAGES=$(jq -cn --arg s "$SYSTEM" '[{role: "system", content: $s}]')
 }
+
+# Going from plan to build, the next prompt carries this note: the switch
+# itself leaves no trace in the conversation, and without it the model tends
+# to look at the whole code again before it starts
+BUILD_NOTE='(Switched from plan mode to build mode: carry out the plan above. '
+BUILD_NOTE+='What you read while planning is still in this conversation; read '
+BUILD_NOTE+='a file again only to get the exact text for an edit, or if it may '
+BUILD_NOTE+='have changed since.)'
+MODE_NOTE=""
 
 # Switches mode and keeps the system message at the head of the history in
 # step, so the model sees the rules of the mode the user is in.
@@ -4393,18 +4407,26 @@ while true; do
             else
               AUTO=1; echo "Commands run WITHOUT confirmation."
             fi ;;
-    /plan)  if [[ "$MODE" == plan ]]; then
-              echo "Already in plan mode."
-            else
-              apply_mode plan
+    /plan|"/plan "*|/build|"/build "*)
+            # /plan TEXT and /build TEXT switch, then send TEXT as a prompt
+            arg=${input#/plan}; arg=${arg#/build}
+            arg=${arg#"${arg%%[![:space:]]*}"}
+            new=plan; [[ "$input" == /build* ]] && new=build
+            if [[ "$MODE" == "$new" ]]; then
+              [[ -n "$arg" ]] || echo "Already in $new mode."
+            elif [[ "$new" == plan ]]; then
+              apply_mode plan; MODE_NOTE=""
               echo "Plan mode: inspect only, no edits (/build to leave)."
-            fi ;;
-    /build) if [[ "$MODE" == build ]]; then
-              echo "Already in build mode."
             else
               apply_mode build
+              # only when there is planning to carry out
+              if [[ "$(last_role)" != system ]]; then MODE_NOTE="$BUILD_NOTE"
+              fi
               echo "Build mode: commands run and files can change."
-            fi ;;
+            fi
+            input="$arg"
+            # the text is a prompt: go round again without reading a line
+            if [[ -n "$input" ]]; then continue; fi ;;
     /help)  echo "/about           version, author, model and session details"
             echo "/provider list   the providers you can use (current one"\
                  "marked)"
@@ -4436,8 +4458,10 @@ while true; do
                  "resumable)"
             echo "/auto            toggle running commands without"\
                  "confirmation (now: $AUTO)"
-            echo "/plan            plan only: read-only commands, no edits"
-            echo "/build           leave plan mode and allow edits again"
+            echo "/plan [TEXT]     plan only: read-only commands, no edits"\
+                 "(TEXT is sent as a prompt)"
+            echo "/build [TEXT]    leave plan mode and allow edits again;"\
+                 "the model is told to carry out the plan"
             echo "/todo [clear]    the model's todo list for this session"
             echo "/plugins         loaded plugins and what they added"
             echo "/exit            quit (or Ctrl-D)"
@@ -4487,6 +4511,9 @@ while true; do
        if [[ -n "$input" ]]; then
          plugin_hooks turn_start "$input"
          auto_compact        # must run before the new message joins the history
+         if [[ -n "$MODE_NOTE" ]]; then
+           input="$MODE_NOTE"$'\n\n'"$input"; MODE_NOTE=""
+         fi
          append "$(printf '%s' "$input" |
                    jq -cRs '{role: "user", content: .}')"
          run_turn

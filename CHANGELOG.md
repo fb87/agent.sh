@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `/tmp on` forks a temporary session that is not saved; `/tmp off` goes back
+  to the session you came from. One session per workspace: a start in a
+  directory that already has a session offers to resume, start a new one or
+  continue the other, and `--new` skips the question.
+- `/plan TEXT` and `/build TEXT` switch mode and send `TEXT` as the prompt in
+  the same step. Switching mode keeps the conversation, and going from plan to
+  build the next prompt carries a note telling the model to carry out the plan
+  rather than read the project again.
+- The plan prompt asks the model to read the files it plans to change itself
+  and to name the functions and lines in the plan.
+
+### Changed
+
+- `/reset` asks before replacing the session and keeps the old one as a
+  backup.
+
+### Removed
+
+- `/btw`, replaced by `/tmp` for side work that should not be saved.
+
 ## [0.6.0] - 2026-11-17
 
 ### Added
