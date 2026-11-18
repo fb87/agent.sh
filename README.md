@@ -6,6 +6,9 @@ GitHub Copilot, OpenAI, OpenRouter and Ollama built in — and can inspect, edit
 and run things in the current directory. Shell plugins can add commands, tools,
 providers and hooks.
 
+The full manual — architecture, every setting, tool, prompt, plugin hook and
+REPL command — is in [MANUAL.md](MANUAL.md).
+
 ```sh
 ./agent.sh                 # REPL
 ./agent.sh "fix the tests" # one-shot
@@ -19,24 +22,26 @@ sub-agents to search the project in parallel, and it has `read`, `edit` and
 
 ## Install
 
-### Nix and NixOS
-
-Run it straight from the flake:
+It is a single bash file, so installing it is copying it onto your `PATH`:
 
 ```sh
-nix run github:fb87/agent.sh
+install -Dm755 agent.sh ~/.local/bin/agent.sh
 ```
 
-Or install it into a profile:
+The script needs `bash`, `jq` and `curl`; if `jq` or `curl` is missing and Nix
+is installed, it is taken from the Nix store instead. The built-in prompts are
+used as they are; put overrides in `~/.config/agent.sh/prompts/` (see below).
+
+If you use Nix, the flake installs the script together with its prompts and
+puts `bash`, `jq` and `curl` on the wrapper's `PATH`:
 
 ```sh
+nix run github:fb87/agent.sh          # run without installing
 nix profile install github:fb87/agent.sh
 ```
 
-The package installs `agent.sh` together with its prompts and puts `bash`,
-`jq` and `curl` on the wrapper's `PATH`. The flake also provides
-`packages.<system>.default`, `apps.default`, `overlays.default`, a dev shell,
-and a NixOS module:
+The flake also provides `packages.<system>.default`, `apps.default`,
+`overlays.default`, a dev shell, and a NixOS module:
 
 ```nix
 {
@@ -56,16 +61,6 @@ and a NixOS module:
   };
 }
 ```
-
-### Anywhere else
-
-```sh
-install -Dm755 agent.sh ~/.local/bin/agent.sh
-```
-
-Put prompt overrides in `~/.config/agent.sh/prompts/` (see below). The script
-needs `bash`, `jq` and `curl`; if `jq` or `curl` is missing and Nix is
-installed, it is taken from the Nix store instead.
 
 ## Configuration
 
@@ -120,7 +115,7 @@ come from the system file.
 The environment wins over the files: `AGENT_API_KEY`, the provider's own key
 variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
 `THINKING`, `TEMPERATURE`. Other knobs are still environment-only; run
-`agent.sh -h` for the rest.
+`agent.sh -h`, or see [MANUAL.md](MANUAL.md) for every variable.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -134,6 +129,10 @@ variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
 | `WEB` | `1` | `0` removes `web_search` and `web_fetch` |
 | `WEB_TIMEOUT` | `30` | seconds one web call may take |
 | `SEARXNG_URL` | unset | SearXNG server for `web_search` |
+| `BRAVE_API_KEY` | unset | Brave Search key for `web_search` (tried first) |
+| `TAVILY_API_KEY` | unset | Tavily key for `web_search` (after Brave) |
+| `COPILOT_GITHUB_TOKEN` | unset | GitHub token instead of `--login copilot` |
+| `SHOW_REASONING` | `1` | `0` stops streaming the model's reasoning |
 | `AUTO_COMPACT` | `1` | `0` turns automatic compaction off |
 | `CONTEXT` | `0` | model context window in tokens; `COMPACT_AT` then defaults to half of it (4 bytes per token) |
 | `COMPACT_AT` | half of `CONTEXT`, else `100000` | history bytes that trigger it |
@@ -150,6 +149,8 @@ variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
 | `SUB_TIMEOUT` | `300` | seconds one explorer may take (`0` = no cap) |
 | `SUB_MAX_STEPS` | `25` | tool rounds one explorer may use |
 | `SESSION_DIR` | `~/.local/state/agent.sh/sessions` | where sessions are saved |
+| `SESSION_ID` | a new uuid | id for a fresh session (letters, digits, `.`, `_`, `-`) |
+| `XDG_STATE_HOME` | `~/.local/state` | base of the session directory |
 | `AGENT_HISTFILE` | `~/.agent_sh_history` | readline history file |
 | `AGENT_HISTORY_MAX` | `1000` | lines kept in that file |
 | `PROMPT_DIR` | unset | explicit prompt directory |
@@ -384,21 +385,20 @@ cmd_stamp() {
 | `/plugins` | list the plugin files and what each one added |
 | `/todo` | show the model's todo list for this session |
 | `/todo clear` | clear the todo list |
-| `/btw <question>` | ask on the side: answered from the conversation so far, but not added to it |
-| `/btw! <question>` | the same without the conversation, for a question of its own |
+| `/tmp on\|off` | fork a temporary session that is not saved; `off` goes back |
 | `/compact` | summarize the history (also automatic past `COMPACT_AT`) |
 | `/sessions [all]` | list saved sessions |
 | `/resume ID` | switch to a session by id or unique prefix |
-| `/reset` | start a new session |
+| `/reset` | start a new session (asks first; the old one stays as a backup) |
 | `/auto` | toggle command confirmation |
 | `/plan` / `/build` | switch between read-only and editing modes |
 | `/exit` | quit (or Ctrl-D) |
 
 Flags: `-y` (run commands without asking, except the ones below), `-p`/`--plan`
 and `-b`/`--build` (the last one wins), `-i` (stay in the REPL after a prompt),
-`-c`, `-r ID`, `-l [all]`, `--login [copilot]`, `-h`, `-V`. A prompt on the
-command line is answered and the agent exits; if the turn fails, the exit
-status is non-zero, so one-shot runs can be used from scripts. `--` ends
+`-c`, `-r ID`, `-l [all]`, `--new`, `--login [copilot]`, `-h`, `-V`. A prompt
+on the command line is answered and the agent exits; if the turn fails, the
+exit status is non-zero, so one-shot runs can be used from scripts. `--` ends
 option parsing. `--login [copilot]` signs in to GitHub Copilot and exits (see
 [GitHub Copilot](#github-copilot)); in the REPL, `/login copilot` signs in and
 switches to it.
@@ -411,6 +411,13 @@ and temperature, plus the context window and its compaction threshold; these
 are saved after each turn and restored by `-c` and `-r`. API keys and URLs are
 never saved. A provider is restored only if it still resolves, and values set
 in the environment for this run are kept.
+
+There is one session per workspace. Starting fresh in a directory that already
+has one asks whether to resume it (`r`), start a new one (`n`, the old one is
+kept as a backup) or cancel (`c`); `--new` starts over without asking, and a
+one-shot run there is not saved unless you pass `-c` or `--new`. A backup
+shows up in `/sessions` with a `backup` tag. Resuming a session of another
+workspace opens it as a temporary one (`/tmp`), which is never saved.
 
 A command is stopped after `CMD_TIMEOUT` seconds when `timeout` is available.
 Commands the model runs do not inherit the API key, and state files are
