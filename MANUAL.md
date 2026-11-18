@@ -5,7 +5,7 @@
 by default, with GitHub Copilot, OpenAI, OpenRouter and Ollama built in), and
 can read, edit and run things in the current directory after asking you.
 
-This manual documents the behaviour of `agent.sh` 0.6.0 exactly as the script
+This manual documents the behaviour of `agent.sh` 0.6.1 exactly as the script
 implements it. The [README](README.md) is the short tour; where the two differ,
 this manual and the script win.
 
@@ -166,7 +166,7 @@ That is all that is required: `bash`, `jq` and `curl` must be installed
 (`need` offers to fetch `jq`/`curl` from Nix when they are missing). The
 built-in prompts are used unless you override them in
 `~/.config/agent.sh/prompts/` (see [First run](#first-run)), so you do not need
-the `pro.mpts` tree. `./agent.sh -V` prints `agent.sh 0.6.0` when it starts.
+the `pro.mpts` tree. `./agent.sh -V` prints `agent.sh 0.6.1` when it starts.
 
 To also get the bundled prompt and prompt-command files, copy `pro.mpts` into
 `$INSTALL_DIR/pro.mpts` — the directory the script itself was resolved to,
@@ -1026,7 +1026,7 @@ Long options are handled before `getopts ":ycr:lhVpbi"`:
 | Option | Effect |
 | --- | --- |
 | `--help` | print the help (the comment block at the top of the script) and exit 0 |
-| `--version` | print `agent.sh 0.6.0` and exit 0 |
+| `--version` | print `agent.sh 0.6.1` and exit 0 |
 | `--plan` | same as `-p` |
 | `--build` | same as `-b` |
 | `--new` | start a new session, keeping the old one as a backup |
@@ -1385,7 +1385,7 @@ build ~/work/agent.sh main* gpt-4.1 12k/50k auto tmp 3f2a91bc $
 
 The `/about` card is printed for every fresh session and on demand. It shows:
 
-- `agent.sh 0.6.0 — a coding agent in bash`, author, release date, MIT;
+- `agent.sh 0.6.1 — a coding agent in bash`, author, release date, MIT;
 - the config file (and whether it was loaded);
 - provider, model, parameters (reasoning/thinking/temperature or "server
   default"), endpoint, and the key source ("set (env OPENAI_API_KEY)");
