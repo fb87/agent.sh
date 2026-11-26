@@ -242,8 +242,8 @@ COPILOT_EDITOR="${COPILOT_EDITOR:-vscode/1.99.3}"
 COPILOT_PLUGIN="${COPILOT_PLUGIN:-copilot-chat/0.26.7}"
 CONFIG_LOADED=0
 
-VERSION="0.6.1"
-RELEASED="2026-11-19"
+VERSION="0.6.2"
+RELEASED="2026-11-26"
 AUTHOR="fb87"                                       # see LICENSE
 
 new_id() {
@@ -4753,8 +4753,8 @@ while true; do
             then
               ans=""
               if { true </dev/tty; } 2>/dev/null; then
-                read -rp "Replace this workspace's session with a new one? The"\
-" current one is kept as a backup. [y/N] " ans </dev/tty || ans=""
+                read -rp "Replace this workspace's session with a new one? \
+The current one is kept as a backup. [y/N] " ans </dev/tty || ans=""
               fi
               case "$ans" in
                 [Yy]|[Yy][Ee][Ss])

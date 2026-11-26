@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.2] - 2026-11-26
 
 ### Added
 
@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unavailable. `/about` and the system prompt say whether it is on.
 - In the REPL, pasted text now arrives as typed lines instead of only its
   first line, and a line ending in `\` continues on the next one.
+
+### Fixed
+
+- The `shellcheck` warning in the `/reset` question is gone, so
+  `nix flake check` passes again.
 
 ## [0.6.1] - 2026-11-19
 
@@ -344,7 +349,8 @@ OpenAI-compatible endpoint (OpenCode Go).
 - Model output is trusted as JSON only as far as the API guarantees it; a
   malformed stream aborts the turn rather than being repaired.
 
-[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/fb87/agent.sh/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/fb87/agent.sh/releases/tag/v0.6.2
 [0.6.1]: https://github.com/fb87/agent.sh/releases/tag/v0.6.1
 [0.6.0]: https://github.com/fb87/agent.sh/releases/tag/v0.6.0
 [0.5.0]: https://github.com/fb87/agent.sh/releases/tag/v0.5.0
