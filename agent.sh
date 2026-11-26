@@ -99,6 +99,8 @@
 # PROMPT_GIT=0 and PROMPT_CONTEXT=0 hide those, PROMPT_MODEL=1 adds the
 # model; /about shows the full session id.
 # Ctrl-C stops the current reply or command without ending the session.
+# A pasted block arrives as the lines pasted, and a line ending in \ goes on
+# on the next one (a "... " prompt), so a prompt or a command can span lines.
 # A command is stopped after CMD_TIMEOUT seconds (600; 0 = never) when the
 # "timeout" program is available.
 # A command that names a path outside the workspace (the git repository, or
@@ -108,6 +110,15 @@
 # dangerous command: a program in ASK_CMDS (sudo, dd, reboot, ...), a forced
 # push, a hard reset, a download piped into a shell. ASK_CMDS="" empties the
 # list. Both read the command text only: a seat belt, not a sandbox.
+# There is a sandbox too: on Linux with Landlock, SANDBOX=auto (the default)
+# runs commands and the file tools in one. They may write only in the
+# workspace, $TMPDIR and ~/.cache, read the system and the usual tool
+# directories, and not see the rest of the home directory (keys, config,
+# sessions). SANDBOX=on refuses to run commands without it, SANDBOX=off turns
+# it off; SANDBOX_NET=0 removes network access, SANDBOX_READ and SANDBOX_WRITE
+# add paths (colon-separated). Its helper is a small C program compiled once
+# with cc, gcc or clang; without a compiler the sandbox is unavailable and
+# commands run as before. /about says whether it is on.
 # jq and curl are required. If one is missing and Nix is installed, it is used
 # from the Nix store (fetched if need be); otherwise agent.sh says what to
 # install and stops.
@@ -1535,6 +1546,7 @@ about() {
   printf '  %-9s %s (outside it: %s)\n' workspace "${WORKSPACE:-$PWD}" \
     "$OUTSIDE"
   printf '  %-9s %s\n' tools "$TOOL_NAMES"
+  printf '  %-9s %s\n' sandbox "$(sandbox_summary)"
   if [[ -n "$CLI_FOUND" ]]; then
     printf '  %-9s %s%s\n' cli "$CLI_FOUND" \
       "$( [[ "$CLI_HINTS" == 0 ]] && echo ' (not suggested: CLI_HINTS=0)')"
@@ -1854,6 +1866,276 @@ if [[ "$CLI_HINTS" != 0 ]]; then
   hints=$(cli_hints)
   if [[ -n "$hints" ]]; then BASE_SYSTEM+=$'\n\n'"$hints"; fi
 fi
+# ------------------------------------------------------------------ sandbox
+
+# On Linux, commands the model runs can be confined with Landlock: they may
+# write only in the workspace (and a private TMPDIR), read the system and
+# the workspace, and not see the rest of the home directory (keys, this
+# agent's config and sessions). Landlock needs a small helper that agent.sh
+# compiles once from the source below (a C compiler is needed that once).
+#   SANDBOX        auto (default: on where it works), on (refuse to run
+#                  commands without it), off
+#   SANDBOX_NET    1 (default) TCP allowed, 0 none (Linux 6.7+)
+#   SANDBOX_READ / SANDBOX_WRITE   more paths, separated by colons
+# The read, write and edit tools do their file access through it too.
+SANDBOX="${SANDBOX:-auto}"
+SANDBOX_NET="${SANDBOX_NET:-1}"
+SANDBOX_READ="${SANDBOX_READ:-}"
+SANDBOX_WRITE="${SANDBOX_WRITE:-}"
+SANDBOX_BIN=""            # the helper, when the sandbox is in use
+SANDBOX_ABI=""
+SANDBOX_WHY=""            # why it is not in use
+SANDBOX_ARGS=()
+# read, not $(cat ...): an old bash miscounts parentheses in a here-document
+# inside a command substitution
+IFS= read -r -d '' LANDLOCK_SRC <<'LANDLOCK_C' || true
+/* landlock-run: run a command under a Landlock sandbox (agent.sh).
+ *
+ *   landlock-run [-r PATH]... [-w PATH]... [-n] -- COMMAND [ARG]...
+ *   landlock-run -V        print the kernel's Landlock ABI (fails if none)
+ *
+ * -r PATH  may be read and executed (files and directories beneath it)
+ * -w PATH  may be read, executed, written, created and removed beneath it
+ * -n       no TCP connect or bind at all (needs ABI 4, Linux 6.7)
+ * Everything else on the file system is denied. Paths that do not exist are
+ * skipped. With ABI 6 the command also cannot signal processes outside the
+ * sandbox (the agent) or reach their abstract unix sockets.
+ * No headers beyond libc: the Landlock structures are declared here.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef SYS_landlock_create_ruleset
+#define SYS_landlock_create_ruleset 444
+#define SYS_landlock_add_rule 445
+#define SYS_landlock_restrict_self 446
+#endif
+
+struct ruleset_attr { uint64_t fs, net, scoped; };
+struct path_attr { uint64_t allowed; int32_t fd; } __attribute__((packed));
+
+#define FS_EXECUTE     (1ULL << 0)
+#define FS_WRITE_FILE  (1ULL << 1)
+#define FS_READ_FILE   (1ULL << 2)
+#define FS_READ_DIR    (1ULL << 3)
+#define FS_REFER       (1ULL << 13)   /* ABI 2 */
+#define FS_TRUNCATE    (1ULL << 14)   /* ABI 3 */
+#define FS_IOCTL_DEV   (1ULL << 15)   /* ABI 5 */
+#define FS_ALL_V1      ((1ULL << 13) - 1)
+#define NET_ALL        3ULL           /* bind and connect TCP, ABI 4 */
+#define SCOPE_ALL      3ULL           /* abstract sockets, signals, ABI 6 */
+/* the rights a rule on a file (not a directory) may carry */
+#define FS_FILE_RIGHTS (FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | \
+                        FS_TRUNCATE | FS_IOCTL_DEV)
+
+static int abi(void)
+{
+    return (int)syscall(SYS_landlock_create_ruleset, NULL, 0, 1UL);
+}
+
+static void die(const char *what)
+{
+    fprintf(stderr, "landlock-run: %s: %s\n", what, strerror(errno));
+    exit(126);
+}
+
+int main(int argc, char **argv)
+{
+    int v = abi(), i, rs, nonet = 0;
+    uint64_t handled, rd, wr;
+    struct ruleset_attr attr = {0};
+    size_t size;
+
+    if (argc == 2 && strcmp(argv[1], "-V") == 0) {
+        if (v < 1) return 1;
+        printf("%d\n", v);
+        return 0;
+    }
+    if (v < 1) {
+        errno = v < 0 ? errno : ENOSYS;
+        die("Landlock is not available");
+    }
+    handled = FS_ALL_V1;
+    if (v >= 2) handled |= FS_REFER;
+    if (v >= 3) handled |= FS_TRUNCATE;
+    if (v >= 5) handled |= FS_IOCTL_DEV;
+    rd = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR;
+    wr = handled;
+
+    for (i = 1; i < argc && strcmp(argv[i], "--") != 0; i++)
+        if (strcmp(argv[i], "-n") == 0) nonet = 1;
+    attr.fs = handled;
+    size = sizeof(uint64_t);
+    if (v >= 4) {
+        size = 2 * sizeof(uint64_t);
+        if (nonet) attr.net = NET_ALL;
+    }
+    if (v >= 6) {
+        size = sizeof attr;
+        attr.scoped = SCOPE_ALL;
+    }
+    if (nonet && v < 4) {
+        fprintf(stderr, "landlock-run: -n needs Landlock ABI 4 (Linux 6.7)\n");
+        return 126;
+    }
+    rs = (int)syscall(SYS_landlock_create_ruleset, &attr, size, 0UL);
+    if (rs < 0) die("create_ruleset");
+
+    for (i = 1; i < argc && strcmp(argv[i], "--") != 0; i++) {
+        struct path_attr pa;
+        struct stat st;
+        uint64_t want;
+        if (strcmp(argv[i], "-n") == 0) continue;
+        if ((strcmp(argv[i], "-r") && strcmp(argv[i], "-w")) || i + 1 >= argc) {
+            fprintf(stderr, "landlock-run: bad argument %s\n", argv[i]);
+            return 126;
+        }
+        want = argv[i][1] == 'w' ? wr : rd;
+        pa.fd = open(argv[++i], O_PATH | O_CLOEXEC);
+        if (pa.fd < 0) continue;              /* not there: nothing to allow */
+        if (fstat(pa.fd, &st) == 0 && !S_ISDIR(st.st_mode))
+            want &= FS_FILE_RIGHTS;
+        pa.allowed = want & handled;
+        if (syscall(SYS_landlock_add_rule, rs, 1, &pa, 0) < 0)
+            die(argv[i]);
+        close(pa.fd);
+    }
+    if (i >= argc - 1) {
+        fprintf(stderr, "usage: landlock-run [-r PATH]... [-w PATH]... [-n]"
+                        " -- COMMAND [ARG]...\n");
+        return 126;
+    }
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
+    if (syscall(SYS_landlock_restrict_self, rs, 0) < 0) die("restrict_self");
+    close(rs);
+    execvp(argv[i + 1], argv + i + 1);
+    die(argv[i + 1]);
+    return 126;
+}
+LANDLOCK_C
+
+# Finds or builds the helper and checks that the kernel has Landlock
+sandbox_setup() {
+  local dir sum bin tmpd cc
+  case "$SANDBOX" in
+    off) SANDBOX_WHY="off (SANDBOX=off)"; return 0 ;;
+    auto|on) ;;
+    *) echo "agent.sh: SANDBOX must be auto, on or off" >&2; exit 2 ;;
+  esac
+  [[ "$SANDBOX_NET" =~ ^[01]$ ]] ||
+    { echo "agent.sh: SANDBOX_NET must be 1 or 0" >&2; exit 2; }
+  if [[ "$(uname -s)" != Linux ]]; then
+    SANDBOX_WHY="not available: Landlock is Linux only"
+  elif [[ -n "${AGENT_SANDBOX_BIN-}" && -x "$AGENT_SANDBOX_BIN" ]]; then
+    bin="$AGENT_SANDBOX_BIN"           # an explorer: the parent's helper
+  else
+    dir="${SESSION_DIR%/*}/bin"
+    sum=$(printf '%s' "$LANDLOCK_SRC" | cksum | cut -d' ' -f1)
+    bin="$dir/landlock-run-$sum"
+    if [[ ! -x "$bin" ]]; then
+      cc=""
+      for dep in cc gcc clang; do
+        if command -v "$dep" >/dev/null 2>&1; then cc="$dep"; break; fi
+      done
+      if [[ -z "$cc" ]]; then
+        SANDBOX_WHY="not available: building its helper needs a C compiler"
+        bin=""
+      elif mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" &&
+           tmpd=$(mktemp -d "$dir/build.XXXXXX") &&
+           printf '%s\n' "$LANDLOCK_SRC" >"$tmpd/landlock-run.c" &&
+           "$cc" -O2 -o "$tmpd/landlock-run" "$tmpd/landlock-run.c" \
+             >"$tmpd/log" 2>&1 &&
+           mv -f "$tmpd/landlock-run" "$bin"; then
+        :
+      else
+        SANDBOX_WHY="not available: its helper did not compile"
+        bin=""
+      fi
+      [[ -n "${tmpd:-}" ]] && rm -rf "$tmpd" 2>/dev/null
+    fi
+  fi
+  if [[ -n "${bin:-}" ]]; then
+    if SANDBOX_ABI=$("$bin" -V 2>/dev/null) && [[ -n "$SANDBOX_ABI" ]]; then
+      SANDBOX_BIN="$bin"
+    else
+      SANDBOX_WHY="not available: this kernel has no Landlock (or it is off)"
+    fi
+  fi
+  if [[ "$SANDBOX_NET" == 0 && -n "$SANDBOX_BIN" ]] &&
+     (( SANDBOX_ABI < 4 )); then
+    SANDBOX_BIN=""
+    SANDBOX_WHY="not available: SANDBOX_NET=0 needs Linux 6.7 (Landlock 4)"
+  fi
+  if [[ -z "$SANDBOX_BIN" && "$SANDBOX" == on ]]; then
+    printf 'agent.sh: SANDBOX=on, but the sandbox is %s\n' "$SANDBOX_WHY" >&2
+    exit 2
+  fi
+  [[ -n "$SANDBOX_BIN" ]] || return 0
+  export AGENT_SANDBOX_BIN="$SANDBOX_BIN"
+  sandbox_rules
+}
+
+# The paths a command may read and write. Not the home directory as a whole:
+# only the tool directories in it that builds read.
+sandbox_rules() {
+  local p h=${HOME%/}
+  SANDBOX_ARGS=()
+  for p in /usr /bin /sbin /lib /lib32 /lib64 /libx32 /libexec /etc /opt \
+           /nix /gnu /snap /run /var /proc /sys /srv; do
+    SANDBOX_ARGS+=(-r "$p")
+  done
+  if [[ -n "$h" ]]; then
+    for p in .local/bin .local/lib .local/share .cargo .rustup go .nvm \
+             .pyenv .rbenv .bun .deno .sdkman .gitconfig .config/git; do
+      SANDBOX_ARGS+=(-r "$h/$p")
+    done
+    SANDBOX_ARGS+=(-w "$h/.cache")
+  fi
+  SANDBOX_ARGS+=(-w /dev -w "$WORKSPACE")
+  [[ "$START_DIR" == "$WORKSPACE" ]] || SANDBOX_ARGS+=(-w "$START_DIR")
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && SANDBOX_ARGS+=(-r "$p")
+  done < <(tr ':' '\n' <<<"$SANDBOX_READ")
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && SANDBOX_ARGS+=(-w "$p")
+  done < <(tr ':' '\n' <<<"$SANDBOX_WRITE")
+  if [[ "$SANDBOX_NET" == 0 ]]; then SANDBOX_ARGS+=(-n); fi
+}
+
+# One line on what the sandbox allows, for /about and the system prompt
+sandbox_summary() {
+  if [[ -z "$SANDBOX_BIN" ]]; then printf '%s' "$SANDBOX_WHY"; return 0; fi
+  printf 'landlock (ABI %s): writes only in %s and $TMPDIR' \
+    "$SANDBOX_ABI" "$(tilde_path "$WORKSPACE")"
+  if [[ "$SANDBOX_NET" == 0 ]]; then printf ', no network'; fi
+}
+
+sandbox_setup
+if [[ -n "$SANDBOX_BIN" ]]; then
+  if [[ "$WORKSPACE" == "${HOME%/}" || "$WORKSPACE" == / ]]; then
+    printf 'agent.sh: warning: the workspace is %s, so the sandbox lets' \
+      "$WORKSPACE" >&2
+    printf ' commands write anywhere in it\n' >&2
+  fi
+  sb="Commands and the read, write and edit tools run in a sandbox: they"
+  sb+=" can write only inside the workspace"
+  sb+=" ($WORKSPACE), \$TMPDIR and ~/.cache, and read the system, the"
+  sb+=" workspace and tool directories, not the rest of the home directory."
+  if [[ "$SANDBOX_NET" == 0 ]]; then sb+=" They have no network."; fi
+  sb+=" A \"Permission denied\" outside those places comes from the sandbox:"
+  sb+=" do not try to get around it; tell the user what you needed."
+  BASE_SYSTEM+=$'\n\n'"$sb"
+fi
+
 PLAN_PROMPT=$(read_prompt PLAN.md "$PLAN_DEFAULT")
 EXPLORE_DEFAULT='You are an explorer: a read-only sub-agent working for '
 EXPLORE_DEFAULT+='another agent, which gave you the task below and cannot see '
@@ -3345,7 +3627,16 @@ run_tool_body() {
     run+=("$TIMEOUT_BIN" -k 5 "$CMD_TIMEOUT")
   fi
   # No exec in the wrapper: it stays as the command's parent
-  run+=(bash -c 'umask "$1"; bash "$2"' _ "$ORIG_UMASK" "$TMP/cmd.sh")
+  if [[ -n "$SANDBOX_BIN" ]]; then
+    # its own scratch space: the agent's (keys included) stays out of reach
+    mkdir -p "$TMP/sandbox" 2>/dev/null || true
+    run+=("$SANDBOX_BIN" "${SANDBOX_ARGS[@]}" -r "$TMP/cmd.sh"
+          -w "$TMP/sandbox" --
+          bash -c 'umask "$1"; export TMPDIR="$3"; bash "$2"' _
+          "$ORIG_UMASK" "$TMP/cmd.sh" "$TMP/sandbox")
+  else
+    run+=(bash -c 'umask "$1"; bash "$2"' _ "$ORIG_UMASK" "$TMP/cmd.sh")
+  fi
   # The main agent holds off SIGTERM while the command runs; an explorer must
   # stay stoppable by its parent, and its commands are read-only anyway.
   if (( ! SUB )); then trap 'got_term=1' TERM; fi
@@ -3485,7 +3776,7 @@ show_diff() {
 
 # read {path, offset?, limit?}: the file with line numbers
 tool_read() {
-  local path off lim total last
+  local path off lim total last err
   path=$(jq -r '.path? // empty | strings' <<<"$1")
   off=$(jq -r '(.offset? // 1) | tonumber? // 1 | floor' <<<"$1") || off=1
   lim=$(jq -r --argjson d "$READ_LINES" \
@@ -3506,17 +3797,22 @@ tool_read() {
     TOOL_OUT="Error: no such file: $path (looked for $FILE_PATH)"
   elif [[ ! -r "$FILE_PATH" ]]; then
     TOOL_OUT="Error: $path cannot be read (permission denied)."
-  elif is_binary "$FILE_PATH"; then
-    TOOL_OUT="$path is a binary file ($(wc -c <"$FILE_PATH" | tr -d ' ')"
-    TOOL_OUT+=" bytes); its content is not shown."
+  # every read of the file goes through the sandbox
+  elif ! err=$(sb_exec -- head -c 8192 -- "$FILE_PATH" 2>&1 >"$TMP/read.probe")
+  then
+    sb_error read "$path" "$err"
+  elif is_binary "$TMP/read.probe"; then
+    TOOL_OUT="$path is a binary file ($(sb_exec -- wc -c -- "$FILE_PATH" \
+      2>/dev/null | awk '{ print $1 }') bytes); its content is not shown."
   else
-    total=$(awk 'END { print NR }' "$FILE_PATH" 2>/dev/null) || total=0
+    total=$(sb_exec -- awk 'END { print NR }' "$FILE_PATH" 2>/dev/null) ||
+      total=0
     if (( total == 0 )); then
       TOOL_OUT="($path is empty)"
     elif (( off > total )); then
       TOOL_OUT="($path has only $total lines)"
     else
-      awk -v s="$off" -v n="$lim" '
+      sb_exec -- awk -v s="$off" -v n="$lim" '
         NR >= s + n { exit }
         NR >= s     { printf "%6d\t%s\n", NR, $0 }' "$FILE_PATH" \
         >"$TMP/read.out" 2>/dev/null || true
@@ -3551,15 +3847,51 @@ may_change() {
 
 # Puts file $1 in place as FILE_PATH, with the user's own umask. An existing
 # file keeps its permissions (it is overwritten, not replaced).
+# Runs a command through the sandbox when it is on, else as it is. Arguments
+# before "--" are extra sandbox rules (ignored without it). The file tools
+# use it, so read, write and edit get exactly the access a command gets.
+sb_exec() {
+  local -a extra=()
+  while [[ "$1" != -- ]]; do extra+=("$1"); shift; done
+  shift
+  if [[ -n "$SANDBOX_BIN" ]]; then
+    "$SANDBOX_BIN" "${SANDBOX_ARGS[@]}" ${extra[@]+"${extra[@]}"} -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# The error for a file the sandbox kept a tool from, or the tool's own
+sb_error() {
+  local what="$1" path="$2" err="$3"
+  if [[ -n "$SANDBOX_BIN" && "$err" == *"ermission denied"* ]]; then
+    TOOL_OUT="Error: the sandbox does not allow $what $path (outside the"
+    TOOL_OUT+=" paths commands may use). Tell the user if you need it."
+  else
+    TOOL_OUT="Error: could not $what $path: ${err:-unknown error}"
+  fi
+}
+
 put_file() {
   local err
-  if ! err=$( { umask "$ORIG_UMASK"
-                mkdir -p "${FILE_PATH%/*}" && cat "$1" >"$FILE_PATH"; } 2>&1 )
-  then
-    TOOL_OUT="Error: could not write $FILE_PATH: ${err:-unknown error}"
+  # through the sandbox: the new content is read from our scratch file
+  if ! err=$(sb_exec -r "$1" -- bash -c \
+               'umask "$1"; mkdir -p "${2%/*}" && cat "$3" >"$2"' _ \
+               "$ORIG_UMASK" "$FILE_PATH" "$1" 2>&1); then
+    sb_error write "$FILE_PATH" "$err"
     return 1
   fi
   return 0
+}
+
+# Copies the file being changed to $1 through the sandbox; fails with
+# TOOL_OUT set if it may not be read
+fetch_file() {
+  local err
+  if ! err=$(sb_exec -- cat -- "$FILE_PATH" 2>&1 >"$1"); then
+    sb_error read "$FILE_PATH" "$err"
+    return 1
+  fi
 }
 
 # write {path, content}: creates the file or replaces all of it
@@ -3580,8 +3912,9 @@ tool_write() {
   may_change || return 0
   gate "$FILE_OUTSIDE" "" || return 0
   if (( ! SUB )); then
-    if [[ -f "$FILE_PATH" ]] && ! is_binary "$FILE_PATH"; then
-      show_diff "$FILE_PATH" "$TMP/arg.content"
+    if [[ -f "$FILE_PATH" ]] && fetch_file "$TMP/write.old" 2>/dev/null &&
+       ! is_binary "$TMP/write.old"; then
+      show_diff "$TMP/write.old" "$TMP/arg.content"
     else
       head -n 20 "$TMP/arg.content" | strip_controls |
         sed $'s/^.*$/\033[32m+&\033[0m/' >&2
@@ -3620,13 +3953,14 @@ tool_edit() {
     TOOL_OUT="Error: no such file: $path. Use write to create a file."
     return 0
   fi
-  if is_binary "$FILE_PATH"; then
+  fetch_file "$TMP/edit.old" || return 0
+  if is_binary "$TMP/edit.old"; then
     TOOL_OUT="Error: $path is a binary file; edit cannot change it."
     return 0
   fi
   # read -d '' takes the whole file, trailing newlines included (a plain
   # $(...) would drop them)
-  IFS= read -r -d '' content <"$FILE_PATH" || true
+  IFS= read -r -d '' content <"$TMP/edit.old" || true
   IFS= read -r -d '' old <"$TMP/arg.old" || true
   IFS= read -r -d '' new <"$TMP/arg.new" || true
   if [[ -z "$old" ]]; then
@@ -3655,7 +3989,7 @@ tool_edit() {
   if [[ "$all" == true ]]; then content=${content//"$old"/"$new"}
   else content=${content/"$old"/"$new"}; fi
   printf '%s' "$content" >"$TMP/edit.new"
-  show_diff "$FILE_PATH" "$TMP/edit.new"
+  show_diff "$TMP/edit.old" "$TMP/edit.new"
   if [[ -z "$GATE_OK" ]]; then
     confirm "Apply it?" "to make this change" \
       "run with -y to approve changes up front" || return 0
@@ -4307,6 +4641,36 @@ if [[ -f "$AGENT_HISTFILE" ]] &&
 fi
 [[ -f "$AGENT_HISTFILE" ]] && chmod 600 "$AGENT_HISTFILE" 2>/dev/null || true
 history -r "$AGENT_HISTFILE" 2>/dev/null || true
+# A pasted block must arrive as typed lines, so that the lines after the first
+# wait in the terminal and read_more can collect them; with bracketed paste
+# readline takes the whole block and read keeps only its first line
+bind 'set enable-bracketed-paste off' 2>/dev/null || true
+
+# After the first line: the rest of a pasted block, already waiting in the
+# terminal (it came in while readline had it in raw mode, so the lines end
+# in carriage returns), and lines continued with a trailing backslash
+read_more() {
+  local more rc
+  # only at a terminal: piped input is a script, one prompt per line
+  [[ -t 0 ]] || return 0
+  while :; do
+    more="" rc=0
+    IFS= read -r -t 0.1 -d $'\r' more || rc=$?
+    if (( rc == 0 )) || [[ -n "$more" ]]; then
+      line+=$'\n'"${more%$'\n'}"
+      printf '\033[2m%s\033[0m\n' "${more%$'\n'}" >&2  # paste is not echoed
+      (( rc == 0 )) || break           # a last line without a line break
+      continue
+    fi
+    break
+  done
+  # typed: a line ending in a backslash goes on on the next one
+  while [[ "$line" == *\\ ]]; do
+    line=${line%\\}
+    IFS= read -erp "... " more || break
+    line+=$'\n'"$more"
+  done
+}
 
 plugin_hooks start
 input="$FIRST_PROMPT"
@@ -4320,7 +4684,7 @@ while true; do
     # \001 \002 mark the color codes as zero-width for readline
     prompt_text=$(build_prompt_text)
     input=$(trap - INT
-            IFS= read -erp "$prompt_text" line &&
+            IFS= read -erp "$prompt_text" line && read_more &&
             printf '%s' "$line") || rc=$?
     if (( rc > 128 )); then input=""; continue; fi         # Ctrl-C: new prompt
     (( rc == 0 )) || { echo; break; }                       # Ctrl-D: quit

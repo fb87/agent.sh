@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A sandbox for the commands and file tools, on Linux with Landlock (5.13+):
+  what the model runs can write only in the workspace, `$TMPDIR` and
+  `~/.cache`, read the system, the workspace and the usual tool directories,
+  and no longer sees the rest of the home directory, the API key or the
+  session files. `read`, `edit` and `write` do their file access through the
+  same rules, so a file outside them answers "the sandbox does not allow …".
+  `SANDBOX=auto` (the default) uses it where it works, `on` refuses to run
+  commands without it and `off` turns it off; `SANDBOX_NET=0` also removes
+  network access (Linux 6.7+), and `SANDBOX_READ`/`SANDBOX_WRITE` add paths.
+  The helper is a small C program compiled once on first use with `cc`,
+  `gcc` or `clang`; without a compiler the sandbox is simply reported as
+  unavailable. `/about` and the system prompt say whether it is on.
+- In the REPL, pasted text now arrives as typed lines instead of only its
+  first line, and a line ending in `\` continues on the next one.
+
 ## [0.6.1] - 2026-11-19
 
 ### Added

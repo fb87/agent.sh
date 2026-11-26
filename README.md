@@ -146,6 +146,9 @@ variable (e.g. `OPENAI_API_KEY`), `MODEL`, `PROVIDER`, `URL`, `REASONING`,
 | `WORKSPACE` | git root, else `$PWD` | directory commands may use without a question |
 | `ALLOW_PATHS` | unset | extra directories that need no question, colon-separated |
 | `ASK_CMDS` | `sudo su doas pkexec dd …` | programs that always need approval (`""` = none) |
+| `SANDBOX` | `auto` | Landlock sandbox: `auto`, `on` (refuse to run without it) or `off` |
+| `SANDBOX_NET` | `1` | `0` also takes network access away (Linux 6.7+) |
+| `SANDBOX_READ`, `SANDBOX_WRITE` | unset | colon-separated extra paths commands may read or write |
 | `MAX_STEPS` | `0` | tool rounds per turn (`0` = no limit) |
 | `PROJECT_DOC` | `1` | `0` stops `./AGENTS.md` joining the system prompt |
 | `SUBAGENTS` | `1` | `0` removes the `explore` tool |
@@ -237,6 +240,17 @@ and refuses binaries; reading inside the workspace needs no approval. `edit`
 replaces an exact string in a file and `write` creates or replaces one: both
 show a diff and ask first; a path outside the workspace needs approval too.
 Plan mode refuses all three.
+
+On Linux the commands and the file tools run in a Landlock sandbox: they may
+write only in the workspace, `$TMPDIR` and `~/.cache`, read the system and the
+tool directories, and cannot read the rest of your home directory — keys,
+config and sessions included. `SANDBOX=auto` (the default) uses it where it
+works, `on` refuses to run commands without it, `off` turns it off;
+`SANDBOX_NET=0` removes network access and `SANDBOX_READ`/`SANDBOX_WRITE` add
+paths. Its helper is a small C program compiled once with `cc`, `gcc` or
+`clang`; without one the sandbox is reported as unavailable and everything
+works as before. `/about` shows the state. See
+[MANUAL.md](MANUAL.md#sandbox) for what it does and does not cover.
 
 `web_search` returns titles, URLs and snippets, and `web_fetch` turns a page
 into text. They search with Brave (`BRAVE_API_KEY`), Tavily
@@ -407,6 +421,10 @@ option parsing. `--login [copilot]` signs in to GitHub Copilot and exits (see
 [GitHub Copilot](#github-copilot)); in the REPL, `/login copilot` signs in and
 switches to it.
 
+Pasted text arrives as the lines you pasted, and a line ending in `\` goes on
+on the next one with a `... ` prompt, so a message or a shell command can span
+several lines.
+
 Sessions are JSON files under `~/.local/state/agent.sh/sessions`; `-c`
 continues the latest in the current directory, `-r ID` resumes one, `-l [all]`
 lists them. A fresh session (no `-c`/`-r`) starts with the `/about` card.
@@ -451,7 +469,8 @@ The prompt offers `a` for "always this session", which allows either kind of
 command for the rest of the run; `OUTSIDE` and `ASK_CMDS` set up front do the
 same. This all reads the command text only, so it is a seat belt, not a
 sandbox: a script, a path built at run time or a symbolic link can still go
-elsewhere.
+elsewhere. On Linux the Landlock sandbox above is what confines a command; the
+question decides what it may try, the sandbox decides what it can do.
 
 ## Development
 

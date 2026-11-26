@@ -91,13 +91,16 @@ When the script starts it does, in order:
    `TODAY` (`date +%Y-%m-%d`).
 10. Read the system prompt (`SYSTEM.md` or the built-in), append `AGENTS.md`
     if present and `PROJECT_DOC=1`, add the CLI hints, build the tools JSON.
-11. Create the scratch directory `$TMP` under `${SESSION_DIR%/*}`
+11. `sandbox_setup` — find or build the Landlock helper and compute the
+    rules (see [Sandbox](#sandbox)); when it is on, a paragraph about it is
+    appended to the system prompt.
+12. Create the scratch directory `$TMP` under `${SESSION_DIR%/*}`
     (`.../agent.sh/run.<pid>.XXXXXX`), removing stale `run.<pid>.*` from the
     same pid; install the exit/signal traps.
-12. Find `timeout` and `setsid`, if any.
-13. Load or create the session (see [Sessions](#12-sessions)).
-14. `apply_mode "$MODE"` — choose the system prompt for build or plan.
-15. Run the REPL loop.
+13. Find `timeout` and `setsid`, if any.
+14. Load or create the session (see [Sessions](#12-sessions)).
+15. `apply_mode "$MODE"` — choose the system prompt for build or plan.
+16. Run the REPL loop.
 
 On exit the `EXIT` trap kills a running command's process group, kills any
 explorer still running, and deletes `$TMP`. `SIGHUP` exits 129; a sub-agent's
@@ -145,8 +148,18 @@ explorers never ask questions or save sessions.
 - `umask 077` makes new state files private; the user's original umask is
   restored for the commands the model runs and for files written with `write`.
 - Config, sessions and auth files are created with owner-only permissions.
-- The approval system is a seat belt, not a sandbox: it reads the command text
-  and the paths it names. It cannot see what a script does internally.
+- On Linux, commands and the file tools run inside a **Landlock sandbox**
+  (see [section 6](#sandbox)): they may write only in the workspace, `$TMPDIR`
+  and `~/.cache`, and may not read the rest of the home directory — keys,
+  config and sessions included. `SANDBOX_NET=0` removes network access too.
+  Where the sandbox is not available (no kernel support, no C compiler to
+  build its helper once) agent.sh says so in `/about`, and `SANDBOX=on` makes
+  that a startup error instead.
+- Without the sandbox, the approval system is a seat belt: it reads the
+  command text and the paths it names, so a script, a path built at run time
+  or a symbolic link can still go elsewhere. Even with it, everything the
+  sandbox allows — the workspace and what you add with `SANDBOX_WRITE` — is
+  open to any command, whatever its text says.
 
 ---
 
@@ -428,6 +441,19 @@ Every variable below is read once at startup.
 | `ALLOW_PATHS` | empty | colon-separated extra directories that need no question |
 | `ASK_CMDS` | `sudo su doas pkexec dd mkfs fdisk parted shutdown reboot poweroff halt systemctl nixos-rebuild crontab chown mount umount` | programs that always need approval (empty = none) |
 
+#### Sandbox (Landlock)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SANDBOX` | `auto` | `auto` = use it where it works, `on` = refuse to run commands without it, `off` = none |
+| `SANDBOX_NET` | `1` | `0` also removes network access (needs Linux 6.7+) |
+| `SANDBOX_READ` | — | colon-separated paths commands may read as well |
+| `SANDBOX_WRITE` | — | colon-separated paths commands may write as well |
+
+A value other than those above stops agent.sh with exit code 2. An explorer
+inherits the parent's helper (`AGENT_SANDBOX_BIN`), so the rules are the same
+inside one.
+
 #### Prompt line
 
 | Variable | Default | Meaning |
@@ -459,7 +485,8 @@ All of these stop with exit status 2 and `agent.sh: …`:
 - `CMD_TIMEOUT` must be a whole number of seconds.
 - `WEB_TIMEOUT`, `READ_LINES`, `MAX_OUT`, `COMPACT_AT`, `TIMEOUT`,
   `AGENT_HISTORY_MAX` must be greater than 0.
-- `OUTSIDE` must be `ask`, `allow` or `deny`; `MODE` must be `build` or `plan`.
+- `OUTSIDE` must be `ask`, `allow` or `deny`; `MODE` must be `build` or `plan`;
+  `SANDBOX` must be `auto`, `on` or `off` and `SANDBOX_NET` must be 0 or 1.
 - `reasoning` must be `minimal`, `low`, `medium`, `high` or empty; `thinking`
   must be `on`, `off` or empty; `temperature` must be 0–2.
 - An endpoint URL must be `https://`, `localhost`, `127.0.0.1` or `[::1]`
@@ -716,7 +743,8 @@ Then it asks `Run it? [y/N/a=always, or say why not]` unless `AUTO=1` or the
 question was already answered "always".
 
 It runs with the user's original umask, in its own process group (`setsid`,
-else `set -m`), under `timeout -k 5 CMD_TIMEOUT` when `timeout` is available.
+else `set -m`), under `timeout -k 5 CMD_TIMEOUT` when `timeout` is available,
+and inside the [sandbox](#sandbox) when it is on, with its own `TMPDIR`.
 Output is streamed and kept to `MAX_OUT` bytes, keeping the head and the tail
 with `...[N bytes truncated]...` in between; a non-zero exit code is appended.
 Ctrl-C stops the process group. A removed start directory is recreated, or the
@@ -730,7 +758,9 @@ starts later; `limit` overrides the default. Directories are refused with
 shown"; empty files "(path is empty)"; past the end "(path has only N lines)";
 a partial read ends with "[lines a-b of total; read on with offset N+1]".
 Reading inside the workspace needs no approval; reading outside goes through
-the same gate as `bash`.
+the same gate as `bash`. When the [sandbox](#sandbox) is on, the file is read
+through it: a file outside the paths it allows answers "the sandbox does not
+allow read <path>", like a command would.
 
 ### edit and write
 
@@ -739,7 +769,9 @@ permissions of an existing file. `edit` replaces `old` with `new` exactly once
 unless `replace_all` is true. Both show a diff first: green `+` lines for new
 content (a new file previews its first 20 lines), then ask `Write it?` or
 `Apply it?` unless `AUTO=1`. Outside the workspace the path question comes
-first.
+first. With the [sandbox](#sandbox) on, the file is read and written through
+it, so a path outside the paths it allows answers "the sandbox does not allow
+write <path>" instead of the change being made.
 
 `edit` refuses, with an explanation the model can act on:
 
@@ -785,6 +817,40 @@ BRAVE_API_KEY, TAVILY_API_KEY or SEARXNG_URL."
 with `[HTTP code]`.
 
 Both tools exist only when `WEB=1`; `WEB=0` removes them entirely.
+
+### Sandbox
+
+On Linux with Landlock (5.13 and later) the tools run inside a kernel
+sandbox, and `bash`, `read`, `edit` and `write` all go through it:
+
+- **writes** are allowed in the workspace, the starting directory when it is
+  outside the workspace, `$TMPDIR` (a private `sandbox` directory inside the
+  agent's scratch directory, not the whole of it), `~/.cache`, `/dev` and what
+  `SANDBOX_WRITE` adds;
+- **reads** are allowed of the system (`/usr`, `/bin`, `/nix`, `/etc`, `/opt`,
+  `/run`, `/var`, `/proc`, `/sys`, …), the workspace and the tool directories
+  in the home directory (`.local/bin`, `.cargo`, `.rustup`, `go`, `.nvm`,
+  `.pyenv`, `.rbenv`, `.bun`, `.deno`, `.sdkman`, `.gitconfig`,
+  `.config/git`), plus what `SANDBOX_READ` adds — not the rest of `$HOME`;
+- **network** is TCP connect and bind, unless `SANDBOX_NET=0`;
+- with Landlock 6 the command also cannot signal processes outside the
+  sandbox (the agent) or reach their abstract unix sockets.
+
+The helper is a small C program embedded in the script
+(`landlock-run [-r PATH]… [-w PATH]… [-n] -- COMMAND`). It is compiled once
+with `cc`, `gcc` or `clang` into `$(dirname SESSION_DIR)/bin/`, named after a
+checksum of its source, and reused; `landlock-run -V` prints the kernel's
+Landlock ABI. Without a compiler, or on a kernel without Landlock, the sandbox
+is reported as unavailable and commands run as before (`SANDBOX=auto`, the
+default). `SANDBOX=on` refuses to start without it, `SANDBOX=off` turns it off.
+
+Whatever the sandbox allows is open to every command: a script in the
+workspace can still write elsewhere in the workspace. A refused file shows up
+as "Permission denied", which the file tools translate to "the sandbox does
+not allow read/write <path>"; the system prompt tells the model not to try to
+get around it. A workspace that is `$HOME` (or `/`) gets a warning on stderr,
+since it would leave the whole home directory writable. `/about` shows the
+state; an explorer inherits the parent's helper and rules.
 
 ### Limits
 
@@ -1076,6 +1142,20 @@ Line editing is readline: history is read from `AGENT_HISTFILE` (trimmed to
 `AGENT_HISTORY_MAX` lines, mode 0600) and each line is appended there. Ctrl-C
 draws a fresh prompt and abandons the line; Ctrl-D or `/exit` quits.
 
+Both kinds of multi-line input work:
+
+- **pasting**: a pasted block arrives as several lines, not only its first
+  one. Bracketed paste is turned off so that the lines after the first stay
+  in the terminal and are read after readline is done; they are echoed dimmed
+  and go to the model as one message. A message is sent when the block ends,
+  not line by line.
+- **continuing**: a line that ends in `\` leaves the backslash out and shows a
+  `... ` prompt for the next line; the lines are joined with a newline, so a
+  shell command can be written over several lines, and a message can too.
+
+Piped input is not affected: one line is one message, so a script feeding
+`/plan\ntext` gets exactly that.
+
 Inside a temporary session (`/tmp on`), `/reset`, `/resume` and `/resume ID`
 are refused with "In a temporary session: /tmp off first."
 
@@ -1274,7 +1354,9 @@ Paths inside the workspace need no approval. Paths outside it do, every time,
 
 plus `$TMPDIR` and every absolute entry of `ALLOW_PATHS` (colon-separated).
 `$CONFIG_DIR` is never free, so plugin and config paths are always questioned.
-The start directory and the workspace itself are free.
+The start directory and the workspace itself are free. This is the approval
+layer; on Linux the [sandbox](#sandbox) is a second, independent layer that
+applies whatever the answer is.
 
 `OUTSIDE` decides what happens:
 
@@ -1327,8 +1409,9 @@ terminal (a pipe, a sub-agent, a cron job):
 questions but not the workspace or dangerous-command gate.
 
 This is a seat belt, not a sandbox: it inspects the command text and the paths
-it can see. Run the agent in a directory and with an account you are willing to
-give it.
+it can see. On Linux the [sandbox](#sandbox) is what actually confines the
+command; where it is unavailable, run the agent in a directory and with an
+account you are willing to give it.
 
 ---
 
@@ -1395,7 +1478,8 @@ The `/about` card is printed for every fresh session and on demand. It shows:
 - prompts (`SYSTEM.md from …`), the project doc, the workspace (and the
   outside-workspace policy);
 - the tool names, the CLI line, the plugins, the search backend, the explorer
-  settings, and `bash <version>, jq <version>, curl <version>`.
+  settings, the sandbox (its Landlock ABI, or why it is off) and `bash
+  <version>, jq <version>, curl <version>`.
 
 It is the fastest way to see why a setting is not doing what you expect.
 
@@ -1438,6 +1522,8 @@ Both keep their values in the session.
 | Warning about `api_key` permissions | `chmod 600 ~/.config/agent.sh/config.json` |
 | Warning that `COMPACT_AT` reaches the window | raise `CONTEXT` or lower `COMPACT_AT` |
 | An explorer failed | raise `SUB_TIMEOUT`/`SUB_MAX_STEPS`, or run the search yourself |
+| "the sandbox does not allow …" | the path is outside what the sandbox allows: add it to `SANDBOX_READ`/`SANDBOX_WRITE` |
+| The sandbox is unavailable | no Landlock kernel (Linux 5.13+) or no `cc`/`gcc`/`clang` to build its helper; `SANDBOX=off` silences it |
 
 Debugging tips: `/about` for the effective configuration; `/provider list` for
 key readiness; `/plugins` for what loaded; `bash -x ./agent.sh` to trace the
