@@ -32,7 +32,7 @@ SANDBOX=on ./agent.sh          # refuse to run anything unsandboxed
   commands without it; `SANDBOX=off` turns it off. `SANDBOX_NET=0` takes TCP
   connect and bind away as well (Linux 6.7+). `SANDBOX_READ` and
   `SANDBOX_WRITE` add colon-separated paths.
-- **No compiler, no sandbox, no problem.** The helper is a 130-line C program
+- **No compiler, no sandbox, no problem.** The helper is a small C program
   embedded in the script, built once with `cc`, `gcc` or `clang` into the
   agent's state directory, named after a checksum of its source and reused
   after that. Where a compiler or the kernel is missing, `/about` says why and
